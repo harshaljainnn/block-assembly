@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--extract", action="store_true", help="Extract video frames")
     parser.add_argument("--prepare", action="store_true", help="Prepare datasets")
     parser.add_argument("--train-det", action="store_true", help="Train YOLO object detector")
+    parser.add_argument("--resume", action="store_true", help="Resume YOLO object detector from last checkpoint")
     parser.add_argument("--train-cls", action="store_true", help="Train YOLO state classifier")
     parser.add_argument("--eval", action="store_true", help="Run benchmark evaluation")
     parser.add_argument("--demo", action="store_true", help="Launch live inspection HUD")
@@ -86,7 +87,10 @@ def main():
     elif args.prepare:
         run_cmd("prepare_dataset.py")
     elif args.train_det:
-        run_cmd("train_detector.py")
+        det_args = ["--resume"] if args.resume else []
+        run_cmd("train_detector.py", det_args)
+    elif args.resume:
+        run_cmd("train_detector.py", ["--resume"])
     elif args.train_cls:
         run_cmd("train_classifier.py")
     elif args.eval:

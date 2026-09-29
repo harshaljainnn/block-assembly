@@ -1,4 +1,4 @@
-path: .
+path: C:/Users/melwi/Desktop/block-assembly/yolo_dataset_det
 train: images/train
 val: images/val
 names:

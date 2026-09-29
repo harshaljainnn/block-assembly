@@ -1,8 +1,8 @@
 """
-Dataset preparation script for Block Assembly.
+Dataset preparation script for Block Assembly Quality Inspection.
 Prepares datasets for BOTH:
   1. YOLO Object Detection (yolo_dataset_det/ with images/, labels/, and data.yaml)
-     Auto-annotates bounding boxes using the high-accuracy color segmentation engine.
+     Auto-annotates bounding boxes using the plastic-color segmentation engine.
   2. YOLO State Classification (yolo_dataset_cls/ with train/<state>/ and val/<state>/)
 
 Usage:
@@ -50,7 +50,6 @@ def prepare_detection_dataset(detector):
         os.makedirs(os.path.join(DET_DATASET_DIR, "images", split), exist_ok=True)
         os.makedirs(os.path.join(DET_DATASET_DIR, "labels", split), exist_ok=True)
 
-    # Walk through extracted_frames/parts and extracted_frames/states
     total_annotated = {"train": 0, "val": 0}
 
     for subfolder in ["parts", "states"]:
@@ -58,12 +57,12 @@ def prepare_detection_dataset(detector):
         if not os.path.exists(sub_path):
             continue
 
-        for cat in os.listdir(sub_path):
+        for cat in sorted(os.listdir(sub_path)):
             cat_dir = os.path.join(sub_path, cat)
             if not os.path.isdir(cat_dir):
                 continue
 
-            for fname in os.listdir(cat_dir):
+            for fname in sorted(os.listdir(cat_dir)):
                 if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
                     continue
 
@@ -74,7 +73,7 @@ def prepare_detection_dataset(detector):
                     continue
 
                 h, w = img.shape[:2]
-                detections = detector.detect_hsv(img)
+                detections = detector.detect_color_plastic(img)
 
                 # Copy image to images/<split>/
                 unique_name = f"{subfolder}_{cat}_{fname}"
@@ -94,8 +93,9 @@ def prepare_detection_dataset(detector):
                 total_annotated[split] += 1
 
     # Write data.yaml for YOLO detection training
+    abs_det_dir = os.path.abspath(DET_DATASET_DIR).replace("\\", "/")
     data_yaml = {
-        "path": ".",
+        "path": abs_det_dir,
         "train": "images/train",
         "val": "images/val",
         "names": {i: name for i, name in enumerate(BLOCK_CLASSES)},
@@ -126,7 +126,7 @@ def prepare_classification_dataset():
         return
 
     counts = {}
-    for state_name in os.listdir(states_dir):
+    for state_name in sorted(os.listdir(states_dir)):
         s_dir = os.path.join(states_dir, state_name)
         if not os.path.isdir(s_dir):
             continue
@@ -137,7 +137,7 @@ def prepare_classification_dataset():
         os.makedirs(val_dst, exist_ok=True)
 
         n_tr, n_va = 0, 0
-        for fname in os.listdir(s_dir):
+        for fname in sorted(os.listdir(s_dir)):
             if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
 
@@ -153,7 +153,7 @@ def prepare_classification_dataset():
 
     print("Classification dataset prepared:")
     for st, (tr, va) in counts.items():
-        print(f"  {st:<24}: {tr} train, {va} val")
+        print(f"  {st:<28}: {tr} train, {va} val")
 
 
 def main():

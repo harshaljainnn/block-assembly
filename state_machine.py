@@ -1,7 +1,8 @@
 """
-Assembly State Machine for Block Assembly.
-Enforces sequential assembly progression, implements rolling-window temporal smoothing,
-and latches diagnostic errors when out-of-order steps or spatial violations occur.
+Assembly State Machine for Block Assembly Quality Inspection.
+Enforces sequential assembly progression, implements rolling-window temporal consensus smoothing,
+and strictly latches diagnostic errors when out-of-order steps or spatial violations occur.
+Adapted from the battle-tested Pen Assembly Quality Inspection System.
 """
 
 from collections import deque, Counter
@@ -10,6 +11,11 @@ from block_config import ASSEMBLY_STATES, STEP_TITLES
 
 class AssemblyStateMachine:
     def __init__(self, state_order=None, window_size=10, min_consensus=6):
+        """
+        state_order: ordered list of state names. Defaults to ASSEMBLY_STATES.
+        window_size: number of recent frames to buffer for majority voting (~0.33s @ 30fps).
+        min_consensus: minimum frame votes required to confirm state transition.
+        """
         self.state_order = state_order or ASSEMBLY_STATES
         self.current_index = 0
         self.window_size = window_size
@@ -22,7 +28,7 @@ class AssemblyStateMachine:
         self.skipped_step_index = None
 
     def reset(self):
-        """Resets assembly tracker back to the initial step."""
+        """Resets assembly tracker back to Step 0."""
         self.current_index = 0
         self.history.clear()
         self.error_active = False
@@ -30,7 +36,7 @@ class AssemblyStateMachine:
         self.skipped_step_index = None
 
     def get_consensus(self):
-        """Returns the most frequent valid state in the rolling window and its count."""
+        """Returns the most frequent valid state in the rolling window and its vote count."""
         valid_votes = [s for s in self.history if s is not None and s in self.state_order]
         if not valid_votes:
             return None, 0
@@ -54,7 +60,7 @@ class AssemblyStateMachine:
         ratio = f"{votes}/{len(self.history)}"
 
         # If spatial constraints are violated, latch error immediately
-        if not is_valid_spatial and diagnostic:
+        if not is_valid_spatial and diagnostic and not diagnostic.startswith("PASS"):
             self.error_active = True
             self.error_detail = diagnostic
             return "error", self.error_detail, consensus_state, ratio
@@ -72,7 +78,7 @@ class AssemblyStateMachine:
 
     def update(self, matched_state):
         """
-        Processes a consensus state prediction and enforces sequential assembly.
+        Processes a consensus state prediction and enforces strict sequential assembly.
         """
         if matched_state is None:
             if self.error_active:
@@ -120,7 +126,7 @@ class AssemblyStateMachine:
 
     def get_steps_for_hud(self):
         """
-        Returns sequential inspection checklist for HUD rendering.
+        Returns the 9-step sequential inspection checklist for HUD rendering.
         """
         steps = []
         for i, sname in enumerate(self.state_order):
@@ -133,7 +139,7 @@ class AssemblyStateMachine:
                 st = "error_current" if self.error_active else "current"
             else:
                 st = "pending"
-            steps.append({"title": title, "state": sname, "status": st})
+            steps.append({"title": title, "state": sname, "status": st, "index": i})
         return steps
 
     def is_complete(self):

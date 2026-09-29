@@ -1,5 +1,5 @@
 """
-Assembly Graph & Spatial Rule Engine.
+Assembly Graph & Spatial Rule Engine for Block Assembly.
 Evaluates detected block bounding boxes against the expected multi-part assembly graph,
 verifying both component counts and relative spatial constraints (adjacency, alignment).
 Provides diagnostic error messages pinpointing which joint/block is incorrect.
@@ -24,7 +24,7 @@ def compute_iou(boxA, boxB):
     return iou
 
 
-def are_adjacent(boxA, boxB, max_gap=80):
+def are_adjacent(boxA, boxB, max_gap=90):
     """
     Checks if two bounding boxes touch or are closely adjacent (within max_gap pixels).
     """
@@ -64,7 +64,7 @@ class AssemblyGraph:
                 "inferred_state": "state_0_unstarted",
                 "confidence": 0.0,
                 "is_valid": True,
-                "diagnostic": "No blocks detected in workspace",
+                "diagnostic": "Workspace clear (present parts to begin)",
                 "part_counts": {},
                 "spatial_checks": [],
             }
@@ -81,26 +81,21 @@ class AssemblyGraph:
 
         total_blocks = len(detections)
 
-        # 2. Check each assembly stage starting from most advanced down to base
+        # 2. Check each assembly stage from most advanced down to base
         inferred_state = "state_0_unstarted"
-        best_match_score = 0.0
         diagnostic = "Workspace active"
         is_valid = True
         spatial_checks = []
 
-        # Evaluate against all states
         for state_name in reversed(ASSEMBLY_STATES):
             spec = EXPECTED_PARTS_PER_STATE.get(state_name, {})
             req_parts = spec.get("parts", {})
             min_tot = spec.get("min_total", 0)
 
-            # Check if current detections satisfy the minimum required parts count
             has_required_counts = True
-            missing_part = None
             for req_cls, req_cnt in req_parts.items():
                 if part_counts.get(req_cls, 0) < req_cnt:
                     has_required_counts = False
-                    missing_part = req_cls
                     break
 
             if has_required_counts and total_blocks >= min_tot:
@@ -108,19 +103,33 @@ class AssemblyGraph:
                 break
 
         # 3. Spatial Relationship Checks for the Inferred State
-        if inferred_state == "state_1_blue_green":
+        if inferred_state == "state_1_greenblue":
             blue_boxes = parts_by_class.get("blue_block", [])
             green_boxes = parts_by_class.get("green_block", [])
             if blue_boxes and green_boxes:
                 adj = are_adjacent(blue_boxes[0]["bbox"], green_boxes[0]["bbox"])
-                spatial_checks.append({"rule": "Blue-Green Adjacency", "passed": adj})
+                spatial_checks.append({"rule": "Green-Blue Adjacency", "passed": adj})
                 if not adj:
                     is_valid = False
-                    diagnostic = "ALIGNMENT: Green block not attached to Blue base block"
+                    diagnostic = "ALIGNMENT: Green beam not attached to Blue base block"
                 else:
-                    diagnostic = "PASS: Blue + Green base securely assembled"
+                    diagnostic = "PASS: Green beam + 1 Blue foot attached"
 
-        elif inferred_state == "state_2_red_attached":
+        elif inferred_state == "state_2_green2blue":
+            blue_boxes = parts_by_class.get("blue_block", [])
+            green_boxes = parts_by_class.get("green_block", [])
+            if len(blue_boxes) >= 2 and green_boxes:
+                adj1 = are_adjacent(blue_boxes[0]["bbox"], green_boxes[0]["bbox"])
+                adj2 = are_adjacent(blue_boxes[1]["bbox"], green_boxes[0]["bbox"])
+                all_attached = adj1 and adj2
+                spatial_checks.append({"rule": "Both Blue Feet Attached", "passed": all_attached})
+                if not all_attached:
+                    is_valid = False
+                    diagnostic = "LOOSE FOOT: One of the Blue feet is detached from Green beam"
+                else:
+                    diagnostic = "PASS: Both Blue feet securely attached (2-legged base)"
+
+        elif inferred_state == "state_3_first_red":
             red_boxes = parts_by_class.get("red_block", [])
             green_boxes = parts_by_class.get("green_block", [])
             if red_boxes and green_boxes:
@@ -128,28 +137,39 @@ class AssemblyGraph:
                 spatial_checks.append({"rule": "Red-Green Adjacency", "passed": adj})
                 if not adj:
                     is_valid = False
-                    diagnostic = "ALIGNMENT: Red block not connected to Green block"
+                    diagnostic = "ALIGNMENT: Red block not connected to Green beam"
                 else:
-                    diagnostic = "PASS: Red block attached correctly"
+                    diagnostic = "PASS: First Red block attached to Green beam"
 
-        elif inferred_state in ["state_3_yellow_attached", "state_4_blue2_attached", "state_5_mid_assembly"]:
-            # Check cluster connectivity across all parts
+        elif inferred_state == "state_4_yellowred":
+            yellow_boxes = parts_by_class.get("yellow_block", [])
+            red_boxes = parts_by_class.get("red_block", [])
+            if yellow_boxes and red_boxes:
+                adj = are_adjacent(yellow_boxes[0]["bbox"], red_boxes[0]["bbox"])
+                spatial_checks.append({"rule": "Yellow-Red Joint", "passed": adj})
+                if not adj:
+                    is_valid = False
+                    diagnostic = "ALIGNMENT: Yellow block not connected adjacent to Red block"
+                else:
+                    diagnostic = "PASS: First Yellow block connected next to Red block"
+
+        elif inferred_state in ["state_5_bothred", "state_6_yellowafter2red"]:
+            # Check connectivity across all parts in cluster
             connected = True
-            for i in range(len(detections) - 1):
+            for i in range(len(detections)):
                 boxA = detections[i]["bbox"]
-                # Must be adjacent to at least one other block
                 has_adj = any(are_adjacent(boxA, detections[j]["bbox"]) for j in range(len(detections)) if j != i)
                 if not has_adj:
                     connected = False
                     break
-            spatial_checks.append({"rule": "Full Assembly Connectivity", "passed": connected})
+            spatial_checks.append({"rule": "Mid-Assembly Cluster Integrity", "passed": connected})
             if not connected:
                 is_valid = False
                 diagnostic = "LOOSE PART: One or more blocks are detached from the assembly"
             else:
-                diagnostic = f"PASS: {STEP_TITLES.get(inferred_state, inferred_state)} satisfied"
+                diagnostic = f"PASS: {STEP_TITLES.get(inferred_state, inferred_state)} verified"
 
-        elif inferred_state in ["state_6_red2_attached", "state_7_yellow2_attached", "state_8_complete"]:
+        elif inferred_state in ["state_7_finalred", "state_8_complete"]:
             connected = True
             for i in range(len(detections)):
                 boxA = detections[i]["bbox"]
@@ -160,11 +180,11 @@ class AssemblyGraph:
             spatial_checks.append({"rule": "Complete Structure Integrity", "passed": connected})
             if not connected:
                 is_valid = False
-                diagnostic = "STRUCTURAL DEFECT: Blocks are detached or misaligned"
+                diagnostic = "STRUCTURAL DEFECT: Blocks are detached or out of alignment"
             else:
-                diagnostic = "PASS: Complete 9-part block structure verified!"
+                diagnostic = "PASS: Complete 9-part block figure verified!"
 
-        # Confidence: average detection confidence of participating parts
+        # Confidence is mean confidence of participating detections
         conf = float(np.mean([d["confidence"] for d in detections])) if detections else 0.0
 
         return {

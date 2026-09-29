@@ -1,7 +1,7 @@
 """
 Frame extraction script for Block Assembly dataset videos.
-Adapted from pen-assembly-version1 with enhanced block-color validation,
-blur filtering, and temporal train/val partitioning.
+Extracts frames from all 12 dataset videos in DATASET/ with Laplacian blur filtering,
+plastic-color visibility validation, and temporal 80/20 train/val partitioning.
 
 Usage:
     python extract_frames.py                  # Auto-extracts from all 12 dataset videos
@@ -23,7 +23,7 @@ from block_config import (
 )
 
 
-def is_blurry(gray_frame, threshold=25.0):
+def is_blurry(gray_frame, threshold=20.0):
     """Calculates Laplacian variance. Low variance indicates motion blur."""
     if threshold <= 0:
         return False
@@ -33,27 +33,21 @@ def is_blurry(gray_frame, threshold=25.0):
 
 def has_block_content(frame, min_area=350):
     """
-    Checks if at least one colored block (Blue, Green, Red, Yellow) is visible.
-    Prevents saving frames where hands completely occlude the object or the block is out of frame.
+    Checks if at least one colored plastic block is visible.
+    Eliminates frames where hands completely occlude the object or the block is out of frame.
     """
+    b, g, r = cv2.split(frame)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-    # Blue range
-    blue_mask = cv2.inRange(hsv, np.array([90, 60, 40]), np.array([135, 255, 255]))
-    # Green range
-    green_mask = cv2.inRange(hsv, np.array([35, 60, 40]), np.array([85, 255, 255]))
-    # Red range (spans 0-10 and 170-180)
-    red1 = cv2.inRange(hsv, np.array([0, 70, 40]), np.array([10, 255, 255]))
-    red2 = cv2.inRange(hsv, np.array([170, 70, 40]), np.array([180, 255, 255]))
-    red_mask = cv2.bitwise_or(red1, red2)
-    # Yellow range
-    yellow_mask = cv2.inRange(hsv, np.array([18, 80, 80]), np.array([34, 255, 255]))
+    blue = (b > 70) & (b > 1.15 * r.astype(np.float32)) & (h >= 90) & (h <= 135) & (s > 50)
+    green = (g > 65) & (g > 1.15 * r.astype(np.float32)) & (h >= 35) & (h <= 85) & (s > 50)
+    red = (r > 95) & (r > 1.50 * g.astype(np.float32)) & ((h <= 14) | (h >= 166)) & (s > 100)
+    yellow = (r > 95) & (g > 75) & (r > 1.35 * b.astype(np.float32)) & (h >= 15) & (h <= 35) & (s > 85)
 
-    combined_mask = cv2.bitwise_or(cv2.bitwise_or(blue_mask, green_mask), cv2.bitwise_or(red_mask, yellow_mask))
-
-    cnts, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = [c for c in cnts if cv2.contourArea(c) > min_area]
-    return len(valid) > 0
+    mask = (blue | green | red | yellow).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return any(cv2.contourArea(c) > min_area for c in cnts)
 
 
 def clean_existing_frames(target_dir):
@@ -75,7 +69,7 @@ def extract_from_video(
     target_category,
     is_part_video=False,
     fps=4.0,
-    blur_thresh=25.0,
+    blur_thresh=20.0,
     val_split=0.20,
     check_visibility=True,
     clean_old=True,
@@ -173,8 +167,8 @@ def main():
     parser.add_argument(
         "--blur_thresh",
         type=float,
-        default=25.0,
-        help="Laplacian variance blur threshold (default: 25.0)",
+        default=20.0,
+        help="Laplacian variance blur threshold (default: 20.0)",
     )
     parser.add_argument(
         "--val_split",
@@ -198,7 +192,7 @@ def main():
     print(f"Found {len(available_videos)} video files in '{args.videos_dir}'. Starting extraction...\n")
 
     results = []
-    for vname in available_videos:
+    for vname in sorted(available_videos):
         vpath = os.path.join(args.videos_dir, vname)
         info = VIDEO_MAPPING.get(vname)
         if not info:

@@ -1,16 +1,17 @@
 """
-Live Visual Assembly Checker for Block Assembly.
+Live Visual Assembly Checker for Block Assembly Quality Inspection.
 Combines:
   - Real-time Object Detection (bounding boxes & incoming block tracking)
   - Assembly Graph Spatial Verification (relative positions & connections)
-  - State Machine Sequential Enforcement & Temporal Smoothing HUD
+  - Dual-Perception Corroboration & Incoming Part Validator
+  - State Machine Strict Sequential Enforcement & Temporal Smoothing HUD
 
 Usage:
-    python live_demo.py                             # Built-in webcam
+    python live_demo.py                             # Default built-in webcam (index 0)
+    python live_demo.py --camera 1                  # External USB / DroidCam PC client
+    python live_demo.py --camera http://<IP>:4747/video # DroidCam WiFi IP stream
     python live_demo.py --video <path_to_video.mp4> # Test on recorded video
     python live_demo.py --image <path_to_image.jpg> # Inspect single image
-    python live_demo.py --camera 1                  # External USB / DroidCam camera
-    python live_demo.py --camera http://<IP>:4747/video # DroidCam WiFi feed
 """
 
 import os
@@ -30,7 +31,7 @@ def draw_hud(frame, result, state_machine, smoothed=True):
       - Bounding boxes around all detected blocks
       - Incoming object callout (highlighting part in hand)
       - Top status banner (PASS / ADVANCED / HOLDING / ERROR)
-      - Right-hand sequential assembly checklist
+      - Right-hand sequential assembly checklist (all 9 steps)
     """
     h, w = frame.shape[:2]
     overlay = frame.copy()
@@ -64,11 +65,14 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         # Box
         cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), box_col, 2)
 
-        # Label badge
-        lbl = f"{cname.replace('_block', '')}: {dconf*100:.0f}%"
+        # Label badge with high-contrast text (black for yellow, white for others)
+        lbl = f"{cname.replace('_block', '')} {dconf*100:.0f}%"
+        text_col = (0, 0, 0) if cname == "yellow_block" else (255, 255, 255)
         (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(frame, (bx, max(0, by - 18)), (bx + tw + 6, max(18, by)), box_col, -1)
-        cv2.putText(frame, lbl, (bx + 3, max(14, by - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        badge_y1 = max(0, by - 18)
+        badge_y2 = max(18, by)
+        cv2.rectangle(frame, (bx, badge_y1), (bx + tw + 6, badge_y2), box_col, -1)
+        cv2.putText(frame, lbl, (bx + 3, badge_y2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_col, 1)
 
     # 2. Highlight Incoming Object (Part in Hand)
     incoming = result.get("incoming_object")
@@ -80,78 +84,86 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         # Pulsing / Thick border around incoming part
         cv2.rectangle(frame, (ix - 3, iy - 3), (ix + iw + 3, iy + ih + 3), badge_col, 3)
         tag = "[INCOMING: VALID]" if is_exp else "[INCOMING: WRONG PART!]"
-        cv2.putText(frame, tag, (ix, max(25, iy - 24)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, badge_col, 2)
+        cv2.putText(frame, tag, (ix, max(25, iy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, badge_col, 2)
 
     # 3. Top Status Banner
+    header_h = 160
     if is_error:
-        header_color = (20, 20, 180)   # Red
+        header_color = (20, 20, 160)   # Crimson Red
         border_color = (0, 0, 255)
         cv2.rectangle(frame, (0, 0), (w, h), border_color, 4)
     elif is_done:
-        header_color = (20, 130, 20)   # Green
+        header_color = (20, 120, 20)   # Forest Green
         border_color = (0, 220, 0)
         cv2.rectangle(frame, (0, 0), (w, h), border_color, 4)
     elif status == "advanced":
-        header_color = (0, 130, 180)   # Gold/Cyan
+        header_color = (15, 60, 95)    # Dark Navy / Blue-Amber Accent
     else:
-        header_color = (30, 30, 30)    # Slate dark gray
+        header_color = (22, 22, 22)    # Industrial Dark Slate
 
-    header_h = 135
-    cv2.rectangle(overlay, (0, 0), (w, header_h), header_color, -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    # Apply semi-transparent header bar directly to ROI
+    sub_header = frame[0:header_h, 0:w]
+    header_bg = np.full(sub_header.shape, header_color, dtype=np.uint8)
+    frame[0:header_h, 0:w] = cv2.addWeighted(sub_header, 0.12, header_bg, 0.88, 0)
 
-    panel_w = 230 if w >= 640 else 180
-    start_x = max(w - panel_w, int(w * 0.60))
+    panel_w = 240 if w >= 640 else 190
+    start_x = max(w - panel_w, int(w * 0.58))
 
-    # Dynamic font scaling based on frame width
-    scale = 0.60 if w >= 640 else 0.45
-    sub_scale = 0.48 if w >= 640 else 0.38
+    scale = 0.65 if w >= 640 else 0.50
+    sub_scale = 0.50 if w >= 640 else 0.40
+
+    # Right side checklist background container
+    sub_chk = frame[4:header_h - 4, max(0, start_x - 6):w - 4]
+    chk_bg = np.full(sub_chk.shape, (10, 10, 10), dtype=np.uint8)
+    frame[4:header_h - 4, max(0, start_x - 6):w - 4] = cv2.addWeighted(sub_chk, 0.20, chk_bg, 0.80, 0)
 
     # Left Side Info
     if is_error:
         cv2.putText(frame, "SEQUENCE REJECTED!", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
-        err_msg = detail or state_machine.error_detail or diagnostic or "Assembly error"
-        if len(err_msg) > 36 and w < 650:
-            err_msg = err_msg[:33] + "..."
+        err_msg = detail or state_machine.error_detail or diagnostic or "Sequence defect detected"
+        if len(err_msg) > 42 and w < 700:
+            err_msg = err_msg[:39] + "..."
         cv2.putText(frame, err_msg, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (200, 230, 255), 1)
-        cv2.putText(frame, f"State: {display_state} ({conf*100:.0f}%)", (12, 85), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (255, 255, 255), 1)
-        cv2.putText(frame, "Fix joint or press 'r' to reset", (12, 112), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 255, 255), 1)
+        cv2.putText(frame, f"Detected: {display_state} ({conf*100:.0f}%)", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (255, 255, 255), 1)
+        if incoming:
+            cv2.putText(frame, incoming["message"][:45], (12, 118), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 255, 255), 1)
+        cv2.putText(frame, "Correct missing part or press 'r' to reset", (12, 145), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 255, 255), 1)
     elif is_done:
-        cv2.putText(frame, "100% COMPLETE & VERIFIED!", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
-        cv2.putText(frame, "All assembly stages verified.", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 255, 220), 1)
-        cv2.putText(frame, "READY FOR NEXT UNIT - Press 'r'", (12, 95), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 255, 255), 1)
+        cv2.putText(frame, "100% COMPLETE & VERIFIED!", (12, 32), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
+        cv2.putText(frame, "All 9 assembly stages verified in order.", (12, 68), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 255, 220), 1)
+        cv2.putText(frame, "Figure structure complete!", (12, 102), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 255, 220), 1)
+        cv2.putText(frame, "READY FOR NEXT UNIT - Press 'r' to reset", (12, 138), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 255, 255), 1)
     else:
         cur_title = state_machine.get_step_title(state_machine.current_index)
-        cv2.putText(frame, f"INSPECT: {cur_title.upper()}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
+        cv2.putText(frame, f"INSPECTION: {cur_title.upper()}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
         cv2.putText(frame, f"LIVE: {display_state} ({conf*100:.0f}%)", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 220, 220), 1)
         stat_color = (0, 220, 255) if status == "advanced" else (220, 180, 50)
-        cv2.putText(frame, f"STATUS: {status.upper()} (Dwell: {votes_ratio})", (12, 85), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, stat_color, 1)
+        cv2.putText(frame, f"STATUS: {status.upper()} (Dwell: {votes_ratio})", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, stat_color, 1)
         next_step = state_machine.get_step_title(state_machine.current_index + 1)
-        cv2.putText(frame, f"Next: [{next_step}]", (12, 112), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (180, 180, 180), 1)
-
-    # 4. Right Side Sequential Checklist
-    cv2.rectangle(overlay, (start_x - 5, 5), (w - 5, header_h - 5), (10, 10, 10), -1)
-    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+        cv2.putText(frame, f"Next: [{next_step}]", (12, 118), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (180, 180, 180), 1)
+        if incoming:
+            inc_col = (0, 255, 0) if incoming["is_expected"] else (50, 50, 255)
+            cv2.putText(frame, incoming["message"][:48], (12, 145), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, inc_col, 1)
 
     steps = state_machine.get_steps_for_hud()
-    for i, s in enumerate(steps[:6]):  # Display top steps neatly
+    for i, s in enumerate(steps):
         st = s["status"]
         if st == "verified":
             tag = "[PASS] "
-            col = (60, 235, 60)
+            col = (60, 235, 60)   # Green
         elif st == "skipped":
             tag = "[MISS] "
-            col = (40, 40, 255)
+            col = (40, 40, 255)   # Red
         elif st in ["current", "error_current"]:
             tag = "[NOW ] "
             col = (50, 180, 255) if st == "error_current" else (240, 210, 40)
         else:
             tag = "[    ] "
-            col = (140, 140, 140)
+            col = (140, 140, 140) # Dim Gray
 
         title = s["title"].split(". ", 1)[-1]
-        text = f"{tag}{i}.{title[:12]}"
-        cv2.putText(frame, text, (start_x, 22 + i * 19), cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
+        text = f"{tag}{i}.{title[:14]}"
+        cv2.putText(frame, text, (start_x, 18 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1)
 
     return frame
 
@@ -181,6 +193,10 @@ def run_video(video_source, detector, sm):
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         print(f"[ERROR] Could not open video source: {video_source}")
+        print("Tip: If using DroidCam client, try device index 1 or 2:")
+        print("     python live_demo.py --camera 1")
+        print("     Or use the direct WiFi IP URL from the DroidCam app:")
+        print("     python live_demo.py --camera http://<PHONE_IP>:4747/video")
         return
 
     print(f"\nLive Inspection started on [{video_source}].")

@@ -1,6 +1,7 @@
 """
-Central configuration for Block Assembly Inspection System.
+Central configuration for Block Assembly Quality Inspection System.
 Defines video mapping, block classes, assembly states, and spatial graph constraints.
+Matches the physical 9-part block giraffe/animal assembly progression.
 """
 
 import os
@@ -14,123 +15,130 @@ CLS_DATASET_DIR = os.path.join(PROJECT_ROOT, "yolo_dataset_cls")
 
 # Block Classes for Object Detection
 BLOCK_CLASSES = [
-    "blue_block",    # 0
-    "green_block",   # 1
-    "red_block",     # 2
-    "yellow_block",  # 3
+    "blue_block",    # 0 (2x2 base feet)
+    "green_block",   # 1 (long rectangular beam / body spine)
+    "red_block",     # 2 (2x2 body stack & head extension)
+    "yellow_block",  # 3 (2x2 front connector, neck & crown)
 ]
 
 BLOCK_COLORS_BGR = {
-    "blue_block": (235, 130, 40),    # Blue in BGR
-    "green_block": (40, 200, 40),    # Green in BGR
-    "red_block": (40, 40, 235),      # Red in BGR
-    "yellow_block": (40, 220, 240),  # Yellow in BGR
+    "blue_block": (235, 130, 40),    # Cyan/Blue
+    "green_block": (40, 200, 40),    # Bright Green
+    "red_block": (40, 40, 235),      # Bright Red
+    "yellow_block": (40, 220, 240),  # Yellow
 }
 
-# Sequential Assembly States
+# Sequential Assembly States (9 stages total, 0 to 8)
 ASSEMBLY_STATES = [
     "state_0_unstarted",
-    "state_1_blue_green",
-    "state_2_red_attached",
-    "state_3_yellow_attached",
-    "state_4_blue2_attached",
-    "state_5_mid_assembly",
-    "state_6_red2_attached",
-    "state_7_yellow2_attached",
+    "state_1_greenblue",
+    "state_2_green2blue",
+    "state_3_first_red",
+    "state_4_yellowred",
+    "state_5_bothred",
+    "state_6_yellowafter2red",
+    "state_7_finalred",
     "state_8_complete",
 ]
 
 # Human-readable step titles for HUD
 STEP_TITLES = {
-    "state_0_unstarted": "0. Unstarted / Parts Stage",
-    "state_1_blue_green": "1. Blue + Green Base",
-    "state_2_red_attached": "2. Red Side Block",
-    "state_3_yellow_attached": "3. Yellow Front Block",
-    "state_4_blue2_attached": "4. Second Blue Block",
-    "state_5_mid_assembly": "5. Mid Joint Assembly",
-    "state_6_red2_attached": "6. Second Red Block",
-    "state_7_yellow2_attached": "7. Second Yellow Block",
-    "state_8_complete": "8. Complete Assembly",
+    "state_0_unstarted": "0. Unstarted / Presenting Parts",
+    "state_1_greenblue": "1. Green + 1 Blue Base",
+    "state_2_green2blue": "2. Green + 2 Blue Feet",
+    "state_3_first_red": "3. First Red Block",
+    "state_4_yellowred": "4. First Yellow Block",
+    "state_5_bothred": "5. Second Red Stack",
+    "state_6_yellowafter2red": "6. Second Yellow Block",
+    "state_7_finalred": "7. Third Red Block",
+    "state_8_complete": "8. Complete 9-Part Assembly",
 }
 
-# Mapping of the 12 WhatsApp dataset videos to parts or states
+# Mapping of dataset videos to parts or states
 VIDEO_MAPPING = {
-    "WhatsApp Video 2026-09-19 at 19.08.02.mp4": {
+    "blue_block.mp4": {
         "type": "part",
         "target": "blue_block",
-        "desc": "Single Blue Block in hand"
+        "desc": "Single Blue Block in hand (base foot)"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.03 (1).mp4": {
+    "green_block.mp4": {
+        "type": "part",
+        "target": "green_block",
+        "desc": "Single Green Beam in hand (main body spine)"
+    },
+    "red_block.mp4": {
         "type": "part",
         "target": "red_block",
         "desc": "Single Red Block in hand"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.03 (2).mp4": {
+    "yellow_block.mp4": {
         "type": "part",
         "target": "yellow_block",
         "desc": "Single Yellow Block in hand"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.03.mp4": {
-        "type": "part",
-        "target": "green_block",
-        "desc": "Single Green Block in hand"
-    },
-    "WhatsApp Video 2026-09-19 at 19.08.37.mp4": {
+    "state1_greenblue.mp4": {
         "type": "state",
-        "target": "state_1_blue_green",
-        "desc": "Step 1: Green block connected to Blue base"
+        "target": "state_1_greenblue",
+        "desc": "Step 1: Green beam attached to 1st Blue base block"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.38 (1).mp4": {
+    "state2_green2blue.mp4": {
         "type": "state",
-        "target": "state_2_red_attached",
-        "desc": "Step 2: Red block attached"
+        "target": "state_2_green2blue",
+        "desc": "Step 2: 2nd Blue foot attached to Green beam (2-legged base)"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.38 (2).mp4": {
+    "state3_first_red.mp4": {
         "type": "state",
-        "target": "state_3_yellow_attached",
-        "desc": "Step 3: Yellow block attached to base"
+        "target": "state_3_first_red",
+        "desc": "Step 3: 1st Red block attached onto Green beam"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.38 (3).mp4": {
+    "state4_yellowred.mp4": {
         "type": "state",
-        "target": "state_4_blue2_attached",
-        "desc": "Step 4: Second blue block attached"
+        "target": "state_4_yellowred",
+        "desc": "Step 4: 1st Yellow block attached next to Red block"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.38.mp4": {
+    "state5_bothred.mp4": {
         "type": "state",
-        "target": "state_5_mid_assembly",
-        "desc": "Step 5: Mid-assembly structure"
+        "target": "state_5_bothred",
+        "desc": "Step 5: 2nd Red block stacked on top of 1st Red block"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.39 (1).mp4": {
+    "state6_yellowafter2red.mp4": {
         "type": "state",
-        "target": "state_6_red2_attached",
-        "desc": "Step 6: Second red block attached"
+        "target": "state_6_yellowafter2red",
+        "desc": "Step 6: 2nd Yellow block attached at top of stack"
     },
-    "WhatsApp Video 2026-09-19 at 20.08.39 (2).mp4": {
+    "state7_finalred.mp4": {
         "type": "state",
-        "target": "state_7_yellow2_attached",
-        "desc": "Step 7: Second yellow block attached"
+        "target": "state_7_finalred",
+        "desc": "Step 7: 3rd Red block attached to front/head"
     },
-    "WhatsApp Video 2026-09-19 at 19.08.39 (2).mp4": {
-        "type": "state",
-        "target": "state_7_yellow2_attached",
-        "desc": "Step 7: Second yellow block attached"
-    },
-    "WhatsApp Video 2026-09-19 at 19.08.39.mp4": {
+    "state8_complete.mp4": {
         "type": "state",
         "target": "state_8_complete",
-        "desc": "Step 8: Fully completed 9-part block assembly"
+        "desc": "Step 8: Complete 9-part block animal assembly"
     },
 }
 
 # Expected parts count per state
 EXPECTED_PARTS_PER_STATE = {
     "state_0_unstarted": {"min_total": 0, "parts": {}},
-    "state_1_blue_green": {"min_total": 2, "parts": {"blue_block": 1, "green_block": 1}},
-    "state_2_red_attached": {"min_total": 3, "parts": {"blue_block": 1, "green_block": 1, "red_block": 1}},
-    "state_3_yellow_attached": {"min_total": 4, "parts": {"blue_block": 1, "green_block": 1, "red_block": 1, "yellow_block": 1}},
-    "state_4_blue2_attached": {"min_total": 5, "parts": {"blue_block": 2, "green_block": 1, "red_block": 1, "yellow_block": 1}},
-    "state_5_mid_assembly": {"min_total": 6, "parts": {"blue_block": 2, "green_block": 1, "red_block": 1, "yellow_block": 1}},
-    "state_6_red2_attached": {"min_total": 7, "parts": {"blue_block": 2, "green_block": 1, "red_block": 2, "yellow_block": 1}},
-    "state_7_yellow2_attached": {"min_total": 8, "parts": {"blue_block": 2, "green_block": 1, "red_block": 2, "yellow_block": 2}},
-    "state_8_complete": {"min_total": 8, "parts": {"blue_block": 2, "green_block": 1, "red_block": 2, "yellow_block": 2}},
+    "state_1_greenblue": {"min_total": 2, "parts": {"green_block": 1, "blue_block": 1}},
+    "state_2_green2blue": {"min_total": 3, "parts": {"green_block": 1, "blue_block": 2}},
+    "state_3_first_red": {"min_total": 4, "parts": {"green_block": 1, "blue_block": 2, "red_block": 1}},
+    "state_4_yellowred": {"min_total": 5, "parts": {"green_block": 1, "blue_block": 2, "red_block": 1, "yellow_block": 1}},
+    "state_5_bothred": {"min_total": 6, "parts": {"green_block": 1, "blue_block": 2, "red_block": 2, "yellow_block": 1}},
+    "state_6_yellowafter2red": {"min_total": 7, "parts": {"green_block": 1, "blue_block": 2, "red_block": 2, "yellow_block": 2}},
+    "state_7_finalred": {"min_total": 8, "parts": {"green_block": 1, "blue_block": 2, "red_block": 3, "yellow_block": 2}},
+    "state_8_complete": {"min_total": 9, "parts": {"green_block": 1, "blue_block": 2, "red_block": 3, "yellow_block": 3}},
+}
+
+# Next required incoming part color per step
+NEXT_REQUIRED_PART = {
+    0: "blue_block",    # or green_block
+    1: "blue_block",    # 2nd blue foot
+    2: "red_block",     # 1st red block
+    3: "yellow_block",  # 1st yellow block
+    4: "red_block",     # 2nd red block (stacked)
+    5: "yellow_block",  # 2nd yellow block
+    6: "red_block",     # 3rd red block (head extension)
+    7: "yellow_block",  # 3rd yellow block (final completion)
 }

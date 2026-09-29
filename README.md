@@ -1,82 +1,93 @@
 # Block Assembly Quality Inspection System
 
-An automated Computer Vision & Deep Learning quality inspection system for multi-part block assembly. It combines real-time **Object Detection** (localizing individual blocks and identifying incoming parts in hand) with an **Assembly Graph Rule Engine** (verifying physical connections, alignments, and sequential order) and **Temporal Consensus Smoothing**.
+An automated Computer Vision & Deep Learning quality inspection system for multi-part toy block assembly. It combines real-time **Object Detection** (localizing individual blocks and verifying parts in hand) with **Assembly Graph Spatial Verification** (checking joints, alignments, and connections), **Whole-Structure State Classification**, and **Temporal Consensus Smoothing** to strictly enforce correct assembly order and catch manufacturing/assembly defects.
 
 ---
 
-## Architecture: Hybrid Perception + Spatial Graph
+## Architecture: Dual-Perception Perception + Spatial Graph
 
 ```
-Raw Camera / Video Frame
-          │
-          ▼
-┌──────────────────────────────────────────────────────────┐
-│              BlockDetector (YOLOv8-detect / HSV)          │
-│  - Detects all blocks: Blue, Green, Red, Yellow          │
-│  - Bounding boxes [x, y, w, h], center coordinates       │
-│  - Incoming part tracking (identifies object in hand)    │
-└──────────────────────────────────────────────────────────┘
-          │                                  │
-          │ Bounding Boxes & Parts           │ Incoming Part Info
-          ▼                                  ▼
-┌──────────────────────────────────┐   ┌──────────────────────────────────┐
-│   Assembly Graph Rule Engine     │   │      Incoming Object Checker     │
-│   (assembly_graph.py)            │   │  - Verifies part color matches   │
-│  - Checks physical adjacency     │   │    next required assembly step   │
-│  - Validates block connections   │   │  - Alerts if wrong block is      │
-│  - Pinpoints exact joint defects │   │    brought into frame            │
-└──────────────────────────────────┘   └──────────────────────────────────┘
-          │                                  │
-          └────────────────┬─────────────────┘
-                           ▼
-          ┌──────────────────────────────────┐
-          │    AssemblyStateMachine          │
-          │  - Rolling-window consensus      │
-          │  - Strict sequential advance     │
-          │  - Skipped step error latching   │
-          └──────────────────────────────────┘
-                           │
-                           ▼
-          ┌──────────────────────────────────┐
-          │     Industrial Inspection HUD    │
-          │  - Bounding boxes & part labels  │
-          │  - PASS / HOLD / REJECT banner   │
-          │  - 8-Step sequential checklist   │
-          └──────────────────────────────────┘
+Raw Camera / Video Stream (Webcam / DroidCam / Video)
+                     │
+                     ▼
+   ┌───────────────────────────────────┐
+   │        ComponentDetector          │
+   │  (Dual-Perception Mutual Engine)  │
+   └───────────────────────────────────┘
+         │                       │
+         ▼                       ▼
+┌──────────────────┐    ┌──────────────────────────────┐
+│  Block Detector  │    │      Macro State Model       │
+│  (YOLOv8 Detect) │    │      (YOLOv8 Classifier)     │
+│  - Blue blocks   │    │  - Classifies Stage 0 to 8   │
+│  - Red blocks    │    │    from whole visual layout  │
+│  - Green beam    │    └──────────────────────────────┘
+│  - Yellow blocks │                     │
+└──────────────────┘                     │
+         │                               │
+         ├───────────────────────────────┤
+         ▼                               ▼
+┌──────────────────────────────────────────────┐
+│       Assembly Graph & Part Corroboration    │
+│  - Checks required part counts per stage     │
+│  - Validates physical adjacency & joints     │
+│  - Tracks incoming part in hand              │
+│    (Alerts: "VALID" vs "WRONG PART")         │
+│  - Cross-corroborates Detector + Classifier  │
+└──────────────────────────────────────────────┘
+                     │
+                     ▼
+┌──────────────────────────────────────────────┐
+│         AssemblyStateMachine                 │
+│  - 10-frame Rolling Temporal Consensus      │
+│  - Strict Sequential Progression             │
+│  - Latches RED "SEQUENCE REJECTED" on skips  │
+└──────────────────────────────────────────────┘
+                     │
+                     ▼
+┌──────────────────────────────────────────────┐
+│           Industrial Inspection HUD          │
+│  - PASS (Green) / HOLD (Slate) / REJECT (Red)│
+│  - Live 9-Step Sequential Checklist          │
+│  - Bounding Boxes & Incoming Object Badges   │
+│  - DroidCam (USB & WiFi IP) + Webcam Support │
+└──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Assembly Stages
+## Assembly Stages (9 Stages Total)
 
-| Stage | Name | Description | Required Parts |
-| :---: | :--- | :--- | :--- |
-| **0** | `state_0_unstarted` | Workspace empty / presenting parts | None |
-| **1** | `state_1_blue_green` | Base joint: Green attached to Blue base | 1 Blue, 1 Green |
-| **2** | `state_2_red_attached` | Red block attached to Green/Blue | 1 Blue, 1 Green, 1 Red |
-| **3** | `state_3_yellow_attached` | Yellow block connected to base | 1 Blue, 1 Green, 1 Red, 1 Yellow |
-| **4** | `state_4_blue2_attached` | Second Blue block attached to joint | 2 Blue, 1 Green, 1 Red, 1 Yellow |
-| **5** | `state_5_mid_assembly` | Mid-assembly structure | 2 Blue, 1 Green, 1 Red, 1 Yellow |
-| **6** | `state_6_red2_attached` | Second Red block attached | 2 Blue, 1 Green, 2 Red, 1 Yellow |
-| **7** | `state_7_yellow2_attached`| Second Yellow block attached | 2 Blue, 1 Green, 2 Red, 2 Yellow |
-| **8** | `state_8_complete` | Complete 9-part block figure | 2 Blue, 1 Green, 2 Red, 2 Yellow |
+| Step | State Name | Video Source | Required Incoming Part | Cumulative Parts | Description |
+| :---: | :--- | :--- | :---: | :--- | :--- |
+| **0** | `state_0_unstarted` | *(Workspace presentation)* | — | None | Workspace ready, presenting parts |
+| **1** | `state_1_greenblue` | `state1_greenblue.mp4` | 🟦 **Blue** | 1 Green, 1 Blue | Green beam attached to 1st Blue base foot |
+| **2** | `state_2_green2blue`| `state2_green2blue.mp4`| 🟦 **Blue** | 1 Green, 2 Blue | Second Blue foot attached (2-legged base) |
+| **3** | `state_3_first_red` | `state3_first_red.mp4` | 🟥 **Red** | 1 Green, 2 Blue, 1 Red | First Red block attached onto Green beam |
+| **4** | `state_4_yellowred` | `state4_yellowred.mp4` | 🟨 **Yellow** | 1 Green, 2 Blue, 1 Red, 1 Yellow | First Yellow block attached next to Red block |
+| **5** | `state_5_bothred` | `state5_bothred.mp4` | 🟥 **Red** | 1 Green, 2 Blue, 2 Red, 1 Yellow | Second Red block stacked on first Red block |
+| **6** | `state_6_yellowafter2red` | `state6_yellowafter2red.mp4` | 🟨 **Yellow** | 1 Green, 2 Blue, 2 Red, 2 Yellow | Second Yellow block attached at top of stack |
+| **7** | `state_7_finalred` | `state7_finalred.mp4` | 🟥 **Red** | 1 Green, 2 Blue, 3 Red, 2 Yellow | Third Red block attached to front/head |
+| **8** | `state_8_complete` | `state8_complete.mp4` | 🟨 **Yellow** | 1 Green, 2 Blue, 3 Red, 3 Yellow | Final Yellow block completes 9-part animal figure |
 
 ---
 
-## Quick Start
+## How to Run
 
-### 1. Install Dependencies
+### 1. Unified Interactive Menu
 ```bash
-pip install -r requirements.txt
+python main.py
 ```
 
-### 2. Extract Video Frames
-Extracts frames from the 12 videos in `DATASET/` with blur filtering, block visibility check, and an 80/20 temporal train/val split:
+### 2. Step-by-Step CLI Commands
+
+#### Step A: Extract Frames from Videos
+Extracts frames from all 12 dataset videos in `DATASET/` with Laplacian blur filtering and an 80/20 train/val temporal split:
 ```bash
 python extract_frames.py
 ```
 
-### 3. Prepare Datasets & Auto-Annotate
+#### Step B: Generate Datasets & Labels
 Generates:
 - `yolo_dataset_det/`: Object detection dataset with auto-generated YOLO bounding box labels
 - `yolo_dataset_cls/`: State classification dataset split into stage folders
@@ -84,39 +95,48 @@ Generates:
 python prepare_dataset.py
 ```
 
-### 4. Train Models
-Train the YOLO Object Detector:
+#### Step C: Train Models
+Train the YOLOv8 Object Detector:
 ```bash
 python train_detector.py --epochs 60 --model yolov8s.pt
 ```
 
-*(Optional)* Train the Whole-Scene State Classifier:
+Train the YOLOv8 State Classifier:
 ```bash
-python train_classifier.py --epochs 60
+python train_classifier.py --epochs 60 --model yolov8s-cls.pt
 ```
 
-### 5. Run Live Inspection HUD
+#### Step D: Run Benchmark Evaluation
+Evaluates accuracy on held-out validation frames:
+```bash
+python evaluate.py
+```
+
+#### Step E: Live Inspection HUD
 Launch the real-time HUD with webcam:
 ```bash
 python live_demo.py
 ```
-Or test on one of your recorded dataset videos:
+
+Or connect via external DroidCam:
 ```bash
-python live_demo.py --video "DATASET/WhatsApp Video 2026-09-19 at 19.08.38 (1).mp4"
+# Using DroidCam via USB/PC Client:
+python live_demo.py --camera 1
+
+# Using DroidCam via direct WiFi IP URL:
+python live_demo.py --camera http://<PHONE_IP>:4747/video
 ```
+
+Or test on one of the recorded dataset videos:
+```bash
+python live_demo.py --video "DATASET/state8_complete.mp4"
+```
+
 Or inspect a single image:
 ```bash
-python live_demo.py --image "extracted_frames/states/state_2_red_attached/vid_val_000100.jpg"
+python live_demo.py --image "demo_output.jpg"
 ```
 
-### Controls in Live Mode:
+### Live Controls:
 - **`r`**: Reset sequence tracker back to Step 0.
-- **`q`**: Quit the live inspection window.
-
----
-
-## Unified Interactive Menu
-You can also launch everything via the interactive CLI:
-```bash
-python main.py
-```
+- **`q`**: Quit the inspection window.

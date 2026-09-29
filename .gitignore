@@ -13,6 +13,7 @@ __pycache__/
 
 # Pretrained base weights & training runs
 yolov8*.pt
+yolo11*.pt
 *.pt
 runs_detect/
 runs_classify/

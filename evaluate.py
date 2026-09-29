@@ -1,9 +1,9 @@
 """
 Evaluation and benchmark script for Block Assembly Quality Inspection.
 Evaluates:
-  1. Detection accuracy and part counting on validation frames
-  2. Assembly state sequence classification accuracy
-  3. Spatial rule validation consistency
+  1. Assembly state sequence classification accuracy across held-out validation frames
+  2. Individual block detection recall on isolated component validation frames
+  3. Spatial rule verification consistency
 
 Usage:
     python evaluate.py
@@ -21,9 +21,9 @@ def evaluate_states(detector):
         print(f"[ERROR] '{states_dir}' does not exist. Run extract_frames.py first.")
         return
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
     print(" BENCHMARK: ASSEMBLY STATE CLASSIFICATION ON HELD-OUT VAL FRAMES")
-    print("=" * 70)
+    print("=" * 72)
 
     total_frames = 0
     correct_frames = 0
@@ -59,12 +59,13 @@ def evaluate_states(detector):
         total_frames += s_total
         correct_frames += s_correct
 
-        print(f"  {sname:<28}: {s_correct:>3}/{s_total:<3} ({acc:>5.1f}%)")
+        title = STEP_TITLES.get(sname, sname)
+        print(f"  {title:<32}: {s_correct:>3}/{s_total:<3} ({acc:>5.1f}%)")
 
     overall_acc = (correct_frames / total_frames) * 100.0 if total_frames > 0 else 0.0
-    print("-" * 70)
+    print("-" * 72)
     print(f"  Overall Validation Accuracy: {correct_frames}/{total_frames} ({overall_acc:.1f}%)")
-    print("=" * 70)
+    print("=" * 72)
 
 
 def evaluate_parts(detector):
@@ -72,9 +73,9 @@ def evaluate_parts(detector):
     if not os.path.exists(parts_dir):
         return
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
     print(" BENCHMARK: INDIVIDUAL OBJECT DETECTION ON ISOLATED PART VIDEOS")
-    print("=" * 70)
+    print("=" * 72)
 
     for pname in sorted(os.listdir(parts_dir)):
         p_path = os.path.join(parts_dir, pname)
@@ -96,14 +97,13 @@ def evaluate_parts(detector):
 
             res = detector.analyze(img)
             detections = res.get("detections", [])
-            # Check if target part was detected
             if any(d["class_name"] == pname for d in detections):
                 det_correct += 1
 
         acc = (det_correct / p_total) * 100.0 if p_total > 0 else 0.0
-        print(f"  {pname:<28}: {det_correct:>3}/{p_total:<3} ({acc:>5.1f}%)")
+        print(f"  {pname:<32}: {det_correct:>3}/{p_total:<3} ({acc:>5.1f}%)")
 
-    print("=" * 70)
+    print("=" * 72)
 
 
 def main():
