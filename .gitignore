@@ -11,12 +11,9 @@ __pycache__/
 *.so
 .pytest_cache/
 
-# Pretrained base weights & training runs
-yolov8*.pt
-yolo11*.pt
-*.pt
-runs_detect/
-runs_classify/
+# Pretrained base weights (Ultralytics auto-downloads these to root)
+/yolov8*.pt
+/yolo11*.pt
 
 # Temporary outputs and intermediate extraction dump
 demo_output.jpg
