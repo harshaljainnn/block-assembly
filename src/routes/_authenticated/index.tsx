@@ -3,7 +3,7 @@ import { Badge, Btn, Card, KpiGrid, Page, Progress, td, th } from "@/components/
 import { liveEvents } from "@/lib/assembly-data";
 import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/")({
+export const Route = createFileRoute("/_authenticated/")({
   head: () => ({
     meta: [
       { title: "Live Monitor — Assembly Monitor" },

@@ -4,7 +4,7 @@ import { Badge, Card, Page, inputCls, td, th } from "@/components/assembly/ui";
 import { historyRows, type Cycle } from "@/lib/assembly-data";
 import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/history")({
+export const Route = createFileRoute("/_authenticated/history")({
   head: () => ({
     meta: [
       { title: "Assembly History — Assembly Monitor" },

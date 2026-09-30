@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Card, KpiGrid, Page, Progress, inputCls } from "@/components/assembly/ui";
 import { analyticsRows, fmtDuration } from "@/lib/assembly-data";
 
-export const Route = createFileRoute("/analytics")({
+export const Route = createFileRoute("/_authenticated/analytics")({
   head: () => ({
     meta: [
       { title: "Analytics — Assembly Monitor" },
