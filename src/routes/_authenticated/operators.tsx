@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { Btn, Card, KpiGrid, Page, inputCls, td, th } from "@/components/assembly/ui";
 import { demoOperators, type Operator } from "@/lib/assembly-data";
 
-export const Route = createFileRoute("/operators")({
+export const Route = createFileRoute("/_authenticated/operators")({
   head: () => ({
     meta: [
       { title: "Operators — Assembly Monitor" },
