@@ -23,7 +23,7 @@ function Operators() {
 
   const save = (o: Operator) => {
     const g = Number(goals[o.user_id] ?? o.goal_per_day);
-    if (!Number.isFinite(g) || g < 1) return toast.error("Enter a valid goal.");
+    if (!Number.isFinite(g) || g < 1) { toast.error("Enter a valid goal."); return; }
     setOps((p) => p.map((x) => (x.user_id === o.user_id ? { ...x, goal_per_day: Math.round(g) } : x)));
     toast.success(`Goal saved for ${o.name}.`);
   };

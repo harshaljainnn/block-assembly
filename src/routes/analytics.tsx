@@ -35,7 +35,7 @@ function Analytics() {
   const reasons: Record<string, number> = {};
   failed.forEach((r) => { const k = r.failure_reason || "Other"; reasons[k] = (reasons[k] || 0) + 1; });
   const maxState = Math.max(...Object.values(stateVals));
-  const bottleneck = Object.entries(stateVals).sort((a, b) => b[1] - a[1])[0];
+  const bottleneck = Object.entries(stateVals).sort((a, b) => b[1] - a[1])[0]!;
 
   return (
     <Page
