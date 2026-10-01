@@ -28,3 +28,9 @@ extracted_frames/
 # Operating System files
 Thumbs.db
 .DS_Store
+
+
+
+# Environment variables
+.env
+backend/.env

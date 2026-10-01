@@ -1,6 +1,7 @@
 import os
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -14,20 +15,30 @@ from pydantic import BaseModel, Field
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 CV_API_KEY = os.getenv("CV_API_KEY")
 
+
 if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL is missing")
+    raise RuntimeError(
+        f"SUPABASE_URL is missing. Expected it in: {ENV_FILE}"
+    )
 
 if not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is missing")
+    raise RuntimeError(
+        f"SUPABASE_SERVICE_ROLE_KEY is missing. Expected it in: {ENV_FILE}"
+    )
 
 if not CV_API_KEY:
-    raise RuntimeError("CV_API_KEY is missing")
+    raise RuntimeError(
+        f"CV_API_KEY is missing. Expected it in: {ENV_FILE}"
+    )
 
 
 # ============================================================
@@ -41,7 +52,7 @@ app = FastAPI(
 )
 
 
-# Allow the React dashboard to call the API later.
+# Allow React dashboard to call the API later.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -73,7 +84,7 @@ def supabase_request(
     json_data=None,
 ):
     """
-    Small helper for communicating with Supabase REST API.
+    Communicate with Supabase REST API.
     """
 
     url = f"{SUPABASE_REST_URL}/{table}"
@@ -81,13 +92,21 @@ def supabase_request(
     response = requests.request(
         method=method,
         url=url,
-        headers=supabase_headers(),
+        headers={
+            **supabase_headers(),
+            "Prefer": "return=representation",
+     },
         params=params,
         json=json_data,
         timeout=10,
     )
 
     if not response.ok:
+        print(
+            f"SUPABASE ERROR [{method} {table}]: "
+            f"{response.status_code} {response.text}"
+        )
+
         raise HTTPException(
             status_code=502,
             detail={
@@ -120,11 +139,14 @@ def verify_cv_api_key(api_key: Optional[str]):
 
 
 # ============================================================
-# MODELS
+# REQUEST MODELS
 # ============================================================
 
 class StartAssemblyRequest(BaseModel):
-    operator_id: str = Field(..., description="Operator code, e.g. OP002")
+    operator_id: str = Field(
+        ...,
+        description="Operator code, e.g. OP001",
+    )
 
 
 class EventRequest(BaseModel):
@@ -136,7 +158,7 @@ class EventRequest(BaseModel):
 
     status: str = Field(
         ...,
-        description="holding, advanced, error or completed"
+        description="holding, advanced, error or completed",
     )
 
     confidence: Optional[float] = None
@@ -160,7 +182,7 @@ class EndAssemblyRequest(BaseModel):
 
     status: str = Field(
         ...,
-        description="pass or fail"
+        description="pass or fail",
     )
 
     failure_reason: Optional[str] = None
@@ -231,6 +253,19 @@ def start_assembly(
     assembly = supabase_request(
         "POST",
         "assembly_sessions",
+        params={
+            # IMPORTANT:
+            # Ask Supabase to return the inserted row.
+            "select": (
+                "id,"
+                "cycle_id,"
+                "operator_id,"
+                "start_time,"
+                "status,"
+                "states_completed,"
+                "total_states"
+            )
+        },
         json_data={
             "cycle_id": cycle_id,
             "operator_id": operator["id"],
@@ -249,6 +284,7 @@ def start_assembly(
 
     return {
         "success": True,
+        "message": "Assembly started",
         "assembly": {
             "id": assembly[0]["id"],
             "cycle_id": cycle_id,
@@ -279,7 +315,13 @@ def assembly_event(
         "assembly_sessions",
         params={
             "cycle_id": f"eq.{data.cycle_id}",
-            "select": "id,cycle_id,states_completed,total_states,status",
+            "select": (
+                "id,"
+                "cycle_id,"
+                "states_completed,"
+                "total_states,"
+                "status"
+            ),
             "limit": "1",
         },
     )
@@ -319,6 +361,9 @@ def assembly_event(
     event = supabase_request(
         "POST",
         "assembly_events",
+        params={
+            "select": "id,assembly_id,timestamp,status,state_index"
+        },
         json_data=event_data,
     )
 
@@ -336,11 +381,10 @@ def assembly_event(
     ):
         new_completed = max(
             current_completed,
-            data.state_index
+            data.state_index,
         )
 
     if new_completed != current_completed:
-
         supabase_request(
             "PATCH",
             "assembly_sessions",
@@ -380,7 +424,13 @@ def end_assembly(
         "assembly_sessions",
         params={
             "cycle_id": f"eq.{data.cycle_id}",
-            "select": "id,cycle_id,start_time,states_completed,total_states",
+            "select": (
+                "id,"
+                "cycle_id,"
+                "start_time,"
+                "states_completed,"
+                "total_states"
+            ),
             "limit": "1",
         },
     )
@@ -405,7 +455,7 @@ def end_assembly(
 
     duration_seconds = max(
         0,
-        int((end_time - start_time).total_seconds())
+        int((end_time - start_time).total_seconds()),
     )
 
     # --------------------------------------------------------
