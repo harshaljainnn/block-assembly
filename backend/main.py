@@ -73,6 +73,7 @@ LOCAL_EVENTS = []    # list of event dicts
 
 LATEST_HUD_FRAME: Optional[bytes] = None
 LATEST_FRAME_TIME: float = 0.0
+DAILY_GOAL: int = 50
 
 
 # ============================================================
@@ -203,6 +204,14 @@ class EndAssemblyRequest(BaseModel):
 
     states_completed: Optional[int] = None
     total_states: int = 9
+
+
+class GoalRequest(BaseModel):
+    goal: int = Field(50, ge=1, le=1000)
+
+
+class ResetAssemblyRequest(BaseModel):
+    operator_id: Optional[str] = "OP001"
 
 
 # ============================================================
@@ -695,6 +704,91 @@ def end_assembly(
 
 
 # ============================================================
+# GOAL & RESET ENDPOINTS
+# ============================================================
+
+@app.post("/api/assembly/goal")
+def set_goal(data: GoalRequest):
+    global DAILY_GOAL
+    DAILY_GOAL = data.goal
+    return {"success": True, "goal_target": DAILY_GOAL}
+
+
+@app.post("/api/assembly/reset")
+def reset_assembly(
+    data: Optional[ResetAssemblyRequest] = None,
+    x_cv_api_key: Optional[str] = Header(default=None),
+):
+    verify_cv_api_key(x_cv_api_key)
+
+    if USE_LOCAL_MODE:
+        op_code = (data.operator_id if data else None) or "OP001"
+        op = LOCAL_OPERATORS.get(op_code, {"id": "op_001", "operator_code": "OP001", "name": "Harshal (Station Lead)", "role": "lead"})
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        random_part = secrets.token_hex(2).upper()
+        cycle_id = f"ASM-{timestamp}-{random_part}"
+        session_id = f"sess_{secrets.token_hex(4)}"
+        cycle_number = len(LOCAL_SESSIONS) + 1
+
+        session_data = {
+            "id": session_id,
+            "cycle_id": cycle_id,
+            "cycle_number": cycle_number,
+            "operator_id": op["id"],
+            "operator_code": op["operator_code"],
+            "operator_name": op["name"],
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "end_time": None,
+            "duration_seconds": 0,
+            "status": "in_progress",
+            "states_completed": 0,
+            "total_states": 9,
+            "failure_reason": None,
+        }
+        LOCAL_SESSIONS[cycle_id] = session_data
+
+        event_id = f"evt_{secrets.token_hex(4)}"
+        event_record = {
+            "id": event_id,
+            "assembly_id": session_id,
+            "cycle_id": cycle_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "state_index": 0,
+            "state_name": "state_0_unstarted",
+            "state_title": "0. Unstarted",
+            "status": "holding",
+            "confidence": 1.0,
+            "is_valid": True,
+            "diagnostic": "Station Ready for Next Unit",
+            "consensus": "state_0_unstarted",
+            "error_type": None,
+            "incoming_object": None,
+            "incoming_confidence": None,
+            "incoming_expected": None,
+            "detections": None,
+            "spatial_checks": None,
+            "part_counts": None,
+        }
+        LOCAL_EVENTS.append(event_record)
+
+        return {
+            "success": True,
+            "message": "Assembly reset to Step 0 (Local Mode)",
+            "assembly": {
+                "id": session_id,
+                "cycle_id": cycle_id,
+                "cycle_number": cycle_number,
+                "operator_id": op["operator_code"],
+                "operator_name": op["name"],
+                "status": "in_progress",
+                "states_completed": 0,
+            },
+        }
+
+    return {"success": True, "message": "Reset called"}
+
+
+# ============================================================
 # QUERY ENDPOINTS FOR DASHBOARD
 # ============================================================
 
@@ -749,6 +843,7 @@ def get_latest():
             "total_cycles": total,
             "active_cycle_number": active_cycle_number,
             "cycles_done_today": cycles_done_today,
+            "goal_target": DAILY_GOAL,
             "today_passes": today_passes,
             "today_fails": today_fails,
             "pass_count": passes,
@@ -794,13 +889,20 @@ def dashboard_ui():
           <p class="text-xs text-slate-400">Real-time Quality Inspection & Sequence Guidance</p>
         </div>
       </div>
-      <div class="flex items-center space-x-4">
+      <div class="flex items-center space-x-3">
         <div class="flex items-center gap-2 bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-lg text-xs font-mono text-slate-300">
           <span class="w-2 h-2 rounded-full bg-emerald-400 pulse-live"></span>
           <span id="bridge-status">BRIDGE ACTIVE</span>
         </div>
-        <div class="bg-indigo-600/20 border border-indigo-500/30 text-indigo-300 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-2">
-          <i class="fa-solid fa-user-gear"></i>
+        <div class="bg-indigo-600/20 border border-indigo-500/30 text-indigo-300 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-2 font-mono">
+          <span class="text-indigo-400 font-bold">CYCLE <span id="header-cycle-num">#1</span></span>
+        </div>
+        <button onclick="triggerResetCycle()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 hover:border-emerald-500/50 rounded-lg text-xs font-medium flex items-center gap-1.5 transition shadow-sm" title="Reset checklist back to Step 0">
+          <i class="fa-solid fa-arrows-rotate text-emerald-400"></i>
+          <span>Reset / Next Cycle</span>
+        </button>
+        <div class="bg-slate-800/80 border border-slate-700 text-slate-300 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-2">
+          <i class="fa-solid fa-user-gear text-indigo-400"></i>
           <span id="operator-id">OP001 (Harshal)</span>
         </div>
       </div>
@@ -883,28 +985,39 @@ def dashboard_ui():
     <!-- 2. TOP STATS ROW (5 CARDS) -->
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
       
-      <!-- Card 1: Active Cycle Number -->
+      <!-- Card 1: Daily Goal Target -->
       <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
         <div class="flex items-center justify-between text-slate-400 mb-2">
-          <span class="text-xs font-semibold uppercase tracking-wider">Active Cycle</span>
-          <i class="fa-solid fa-hashtag text-indigo-400"></i>
+          <span class="text-xs font-semibold uppercase tracking-wider">Daily Goal</span>
+          <i class="fa-solid fa-bullseye text-indigo-400 text-base"></i>
         </div>
-        <div id="stat-cycle-num" class="text-3xl font-bold text-indigo-400">#1</div>
-        <div id="stat-cycle-id" class="text-[11px] font-mono text-slate-400 truncate mt-1">Waiting...</div>
-        <div id="stat-cycle-status" class="text-[11px] text-slate-400 mt-1 flex items-center gap-1.5">
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Idle / Ready
+        <div class="flex items-baseline gap-2">
+          <div id="stat-goal-val" class="text-3xl font-bold text-indigo-400">50</div>
+          <span class="text-xs text-slate-500 font-medium">units</span>
+        </div>
+        <div class="text-[11px] text-slate-400 mt-3 flex items-center justify-between">
+          <span>Shift Target</span>
+          <span class="text-indigo-300 font-mono text-[10px] bg-indigo-500/10 border border-indigo-500/20 px-2 py-0.5 rounded">Fixed 50</span>
         </div>
       </div>
 
-      <!-- Card 2: Cycles Done Today -->
+      <!-- Card 2: Cycles Done Today (number / fixed goal) -->
       <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
         <div class="flex items-center justify-between text-slate-400 mb-2">
           <span class="text-xs font-semibold uppercase tracking-wider">Cycles Done Today</span>
-          <i class="fa-solid fa-calendar-day text-emerald-400"></i>
+          <i class="fa-solid fa-calendar-check text-emerald-400 text-base"></i>
         </div>
-        <div id="stat-cycles-done-today" class="text-3xl font-bold text-white">0</div>
-        <div class="text-xs text-slate-400 mt-1">
-          <span id="stat-today-passed" class="text-emerald-400 font-medium">0</span> passed, <span id="stat-today-failed" class="text-rose-400 font-medium">0</span> failed
+        <div class="flex items-baseline gap-2">
+          <span id="stat-cycles-done-today" class="text-3xl font-bold text-white">0</span>
+          <span class="text-slate-500 text-2xl font-light">/</span>
+          <span id="stat-goal-target-display" class="text-2xl font-bold text-indigo-400">50</span>
+        </div>
+        <div class="w-full bg-slate-800 h-2 rounded-full mt-3 overflow-hidden">
+          <div id="stat-goal-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
+        </div>
+        <div class="text-xs text-slate-400 mt-2 flex items-center justify-between">
+          <span><span id="stat-today-passed" class="text-emerald-400 font-medium">0</span> passed, <span id="stat-today-failed" class="text-rose-400 font-medium">0</span> failed</span>
+          <span id="stat-goal-pct" class="text-emerald-400 font-mono font-semibold">0%</span>
         </div>
       </div>
 
@@ -912,7 +1025,7 @@ def dashboard_ui():
       <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
         <div class="flex items-center justify-between text-slate-400 mb-2">
           <span class="text-xs font-semibold uppercase tracking-wider">Progress</span>
-          <i class="fa-solid fa-list-check text-slate-500"></i>
+          <i class="fa-solid fa-list-check text-slate-500 text-base"></i>
         </div>
         <div class="flex items-baseline gap-2">
           <div id="stat-step-num" class="text-3xl font-bold text-white">0</div>
@@ -920,6 +1033,9 @@ def dashboard_ui():
         </div>
         <div class="w-full bg-slate-800 h-2 rounded-full mt-3 overflow-hidden">
           <div id="stat-step-bar" class="bg-emerald-500 h-full rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+        <div class="text-xs text-slate-400 mt-2 truncate">
+          <span id="stat-cycle-status-text" class="text-slate-300 font-medium">Ready</span>
         </div>
       </div>
 
@@ -953,9 +1069,14 @@ def dashboard_ui():
           <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400">Sequential Assembly Checklist</h2>
           <p class="text-xs text-slate-500">Green tick = Verified State &nbsp;•&nbsp; Spinner = Upcoming State to Assemble</p>
         </div>
-        <span id="current-state-title" class="text-sm font-medium text-emerald-400 font-mono bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-lg">
-          0. Unstarted / Presenting Parts
-        </span>
+        <div class="flex items-center gap-2">
+          <span id="current-state-title" class="text-sm font-medium text-emerald-400 font-mono bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-lg">
+            0. Unstarted
+          </span>
+          <button onclick="triggerResetCycle()" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-xs font-mono transition flex items-center gap-1.5" title="Manual reset">
+            <i class="fa-solid fa-arrow-rotate-left text-slate-400"></i> Reset
+          </button>
+        </div>
       </div>
 
       <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-9 gap-2.5" id="steps-container">
@@ -1130,8 +1251,47 @@ def dashboard_ui():
     renderSteps(0);
 
     // ========================================================
-    // REAL-TIME DASHBOARD POLLING
+    // AUTO-RESET & DASHBOARD POLLING
     // ========================================================
+    let lastCompletedCycleId = null;
+    let autoResetTimer = null;
+    let autoResetCountdown = 0;
+    const GOAL_TARGET = 50;
+
+    async function triggerResetCycle() {
+      if (autoResetTimer) {
+        clearInterval(autoResetTimer);
+        autoResetTimer = null;
+      }
+      try {
+        const resp = await fetch("/api/assembly/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        });
+        if (resp.ok) {
+          const res = await resp.json();
+          renderSteps(0);
+          document.getElementById("stat-step-num").innerText = "0";
+          document.getElementById("stat-step-bar").style.width = "0%";
+          document.getElementById("current-state-title").innerText = STEP_NAMES[0];
+          document.getElementById("stat-cycle-status-text").innerText = "Ready for Next Unit";
+          if (res.assembly) {
+            document.getElementById("header-cycle-num").innerText = `#${res.assembly.cycle_number}`;
+          }
+          const banner = document.getElementById("diagnostic-banner");
+          banner.className = "bg-slate-900 border border-slate-800 rounded-2xl p-5 flex items-start gap-4";
+          document.getElementById("banner-icon").className = "p-3 bg-slate-800 text-slate-400 rounded-xl text-xl shrink-0";
+          document.getElementById("banner-icon").innerHTML = '<i class="fa-solid fa-circle-info"></i>';
+          document.getElementById("banner-status").className = "text-sm font-bold uppercase tracking-wider text-slate-300";
+          document.getElementById("banner-status").innerText = "Ready for Assembly";
+          document.getElementById("banner-text").innerText = `Station ready for Unit #${res.assembly?.cycle_number || ''}. Waiting for Step 1 components...`;
+          await pollDashboard();
+        }
+      } catch (e) {
+        console.error("Reset error:", e);
+      }
+    }
+
     async function pollDashboard() {
       try {
         const [latestRes, eventsRes] = await Promise.all([
@@ -1155,39 +1315,82 @@ def dashboard_ui():
             }
           }
 
-          // 1. Update Active Cycle Card
-          if (sess) {
-            document.getElementById("stat-cycle-num").innerText = `#${latestData.active_cycle_number || 1}`;
-            document.getElementById("stat-cycle-id").innerText = sess.cycle_id;
-            
-            const completed = sess.states_completed !== undefined ? sess.states_completed : 0;
-            document.getElementById("stat-step-num").innerText = completed;
-            document.getElementById("stat-step-bar").style.width = `${Math.min(100, (completed / 8) * 100)}%`;
-            renderSteps(completed);
+          // 1. Update Daily Goal & Cycles Done Today Cards
+          const cyclesDone = latestData.cycles_done_today || 0;
+          const goalTarget = latestData.goal_target || GOAL_TARGET;
 
-            let statusText = sess.status.toUpperCase();
-            if (sess.status === "in_progress") {
-              document.getElementById("stat-cycle-status").innerHTML =
-                '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 pulse-live"></span> IN PROGRESS';
-            } else {
-              document.getElementById("stat-cycle-status").innerHTML =
-                `<span class="w-1.5 h-1.5 rounded-full ${sess.status === 'pass' ? 'bg-emerald-400' : 'bg-rose-400'}"></span> ${statusText}`;
-            }
+          document.getElementById("stat-goal-val").innerText = goalTarget;
+          document.getElementById("stat-cycles-done-today").innerText = cyclesDone;
+          document.getElementById("stat-goal-target-display").innerText = goalTarget;
 
-            document.getElementById("current-state-title").innerText = STEP_NAMES[completed] || `Step ${completed}`;
-          }
-
-          // 2. Update Cycles Done Today
-          document.getElementById("stat-cycles-done-today").innerText = latestData.cycles_done_today || 0;
+          const goalPct = Math.min(100, Math.round((cyclesDone / goalTarget) * 100));
+          document.getElementById("stat-goal-bar").style.width = `${goalPct}%`;
+          document.getElementById("stat-goal-pct").innerText = `${goalPct}%`;
           document.getElementById("stat-today-passed").innerText = latestData.today_passes || 0;
           document.getElementById("stat-today-failed").innerText = latestData.today_fails || 0;
+
+          // Header Cycle Info
+          if (latestData.active_cycle_number) {
+            document.getElementById("header-cycle-num").innerText = `#${latestData.active_cycle_number}`;
+          }
+
+          // 2. Handle Cycle Status & Sequential Checklist Auto-Reset
+          if (sess) {
+            const isCompletedCycle = (sess.status === "pass" || sess.status === "completed" || (sess.states_completed === 8 && sess.status !== "in_progress"));
+
+            if (isCompletedCycle) {
+              // Completed state: show 8/8 done and schedule auto-reset for next unit
+              document.getElementById("stat-step-num").innerText = "8";
+              document.getElementById("stat-step-bar").style.width = "100%";
+              document.getElementById("stat-cycle-status-text").innerText = "Cycle Completed (PASS)";
+              document.getElementById("current-state-title").innerText = "8. Complete 9-Part Assembly (PASS)";
+              renderSteps(8);
+
+              if (lastCompletedCycleId !== sess.cycle_id) {
+                lastCompletedCycleId = sess.cycle_id;
+                autoResetCountdown = 4;
+
+                const banner = document.getElementById("diagnostic-banner");
+                banner.className = "bg-emerald-950/40 border border-emerald-500/60 rounded-2xl p-5 flex items-start gap-4 ring-2 ring-emerald-500/30";
+                document.getElementById("banner-icon").className = "p-3 bg-emerald-500/20 text-emerald-400 rounded-xl text-xl shrink-0";
+                document.getElementById("banner-icon").innerHTML = '<i class="fa-solid fa-trophy"></i>';
+                document.getElementById("banner-status").className = "text-sm font-bold uppercase tracking-wider text-emerald-400";
+                document.getElementById("banner-status").innerText = "CYCLE COMPLETE & VERIFIED (PASS)";
+                document.getElementById("banner-text").innerText = `Assembly unit verified successfully! Resetting checklist for next unit in ${autoResetCountdown}s...`;
+
+                if (autoResetTimer) clearInterval(autoResetTimer);
+                autoResetTimer = setInterval(async () => {
+                  autoResetCountdown--;
+                  if (autoResetCountdown > 0) {
+                    document.getElementById("banner-text").innerText = `Assembly unit verified successfully! Resetting checklist for next unit in ${autoResetCountdown}s...`;
+                  } else {
+                    clearInterval(autoResetTimer);
+                    autoResetTimer = null;
+                    await triggerResetCycle();
+                  }
+                }, 1000);
+              }
+            } else {
+              // In progress cycle
+              if (autoResetTimer) {
+                clearInterval(autoResetTimer);
+                autoResetTimer = null;
+              }
+              const completed = sess.states_completed !== undefined ? sess.states_completed : 0;
+              document.getElementById("stat-step-num").innerText = completed;
+              document.getElementById("stat-step-bar").style.width = `${Math.min(100, (completed / 8) * 100)}%`;
+              document.getElementById("stat-cycle-status-text").innerText = `Step ${completed} / 8 In Progress`;
+              document.getElementById("current-state-title").innerText = STEP_NAMES[completed] || `Step ${completed}`;
+              renderSteps(completed);
+            }
+          }
 
           // 3. Update Overall Metrics
           document.getElementById("stat-pass-rate").innerText = `${latestData.pass_rate}%`;
           document.getElementById("stat-total-cycles").innerText = latestData.total_cycles || 0;
 
-          // 4. Update AI Confidence & Alert Banner
-          if (evt) {
+          // 4. Update AI Confidence & Alert Banner (only when cycle is active)
+          if (evt && (!sess || sess.status === "in_progress")) {
             const confPct = evt.confidence ? `${Math.round(evt.confidence * 100)}%` : '--%';
             document.getElementById("stat-confidence").innerText = confPct;
 

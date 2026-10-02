@@ -490,6 +490,8 @@ def run_video(video_source, detector, sm, dashboard=None):
     prev_state_idx = -1
     prev_error_active = False
     last_event_time = 0.0
+    cycle_completed = False
+    cycle_completed_time = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -511,9 +513,29 @@ def run_video(video_source, detector, sm, dashboard=None):
         if dashboard and dashboard.enabled:
             dashboard.update_frame(annotated)
 
+        # Check if sequence machine auto-reset after completion or workspace clear
+        if cycle_completed:
+            elapsed_complete = time.perf_counter() - cycle_completed_time
+            if sm.current_index == 0 or not sm.is_complete() or elapsed_complete >= 4.0:
+                sm.reset()
+                cycle_completed = False
+                prev_state_idx = 0
+                prev_error_active = False
+                last_event_time = time.perf_counter()
+                if dashboard and dashboard.enabled:
+                    dashboard.start_cycle()
+                    dashboard.log_event(
+                        state_index=0,
+                        state_name=sm.current_state(),
+                        status="holding",
+                        confidence=1.0,
+                        diagnostic="Station Ready for Next Unit",
+                    )
+                print("[INFO] Station reset: Next assembly cycle started at Step 0.")
+
         # Log state advancements, defects/errors, or periodic telemetry to Dashboard backend
         if dashboard and dashboard.enabled:
-            if not dashboard.cycle_id:
+            if not dashboard.cycle_id and not cycle_completed:
                 dashboard.start_cycle()
 
             now = time.perf_counter()
@@ -521,7 +543,25 @@ def run_video(video_source, detector, sm, dashboard=None):
             error_changed = (sm.error_active != prev_error_active)
             heartbeat_due = (now - last_event_time > 1.2)
 
-            if state_changed or error_changed or heartbeat_due:
+            # Cycle completion trigger (Step 8 reached)
+            if sm.is_complete() and not cycle_completed:
+                cycle_completed = True
+                cycle_completed_time = now
+                prev_state_idx = sm.current_index
+                prev_error_active = False
+                last_event_time = now
+
+                dashboard.log_event(
+                    state_index=8,
+                    state_name=sm.current_state(),
+                    status="completed",
+                    confidence=res.get("confidence", 1.0),
+                    diagnostic="8. Complete 9-Part Assembly Verified",
+                )
+                dashboard.end_cycle(status="pass", completed=8)
+                print("[INFO] Assembly Cycle Complete (PASS)! Clear workspace to start next unit.")
+
+            elif not cycle_completed and (state_changed or error_changed or heartbeat_due):
                 prev_state_idx = sm.current_index
                 prev_error_active = sm.error_active
                 last_event_time = now
@@ -529,9 +569,6 @@ def run_video(video_source, detector, sm, dashboard=None):
                 if sm.error_active:
                     ev_status = "error"
                     diag = sm.error_detail or res.get("diagnostic", "Assembly defect detected")
-                elif sm.is_complete():
-                    ev_status = "completed"
-                    diag = "Assembly Completed & Verified"
                 elif state_changed:
                     ev_status = "advanced"
                     diag = res.get("diagnostic", f"Advanced to Step {sm.current_index}")
@@ -547,9 +584,6 @@ def run_video(video_source, detector, sm, dashboard=None):
                     diagnostic=diag,
                 )
 
-                if sm.is_complete() and state_changed:
-                    dashboard.end_cycle(status="pass", completed=8)
-
         cv2.imshow(window_name, annotated)
 
         key = cv2.waitKey(1) & 0xFF
@@ -563,11 +597,19 @@ def run_video(video_source, detector, sm, dashboard=None):
             break
         elif do_reset:
             sm.reset()
-            prev_state_idx = -1
+            cycle_completed = False
+            prev_state_idx = 0
             prev_error_active = False
             last_event_time = 0.0
             if dashboard and dashboard.enabled:
                 dashboard.start_cycle()
+                dashboard.log_event(
+                    state_index=0,
+                    state_name=sm.current_state(),
+                    status="holding",
+                    confidence=1.0,
+                    diagnostic="Sequence Reset to Step 0",
+                )
             print("[INFO] Sequence tracker reset to Step 0.")
         elif do_snap:
             os.makedirs("snapshots", exist_ok=True)

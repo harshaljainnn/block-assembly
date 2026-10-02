@@ -79,7 +79,7 @@ class AssemblyStateMachine:
         # Auto-reset check when assembly cycle is completed
         if self.is_complete():
             self.completion_frames += 1
-            if self.empty_workspace_frames >= 20 or self.completion_frames >= 120:
+            if self.empty_workspace_frames >= 10 or self.completion_frames >= 90:
                 self.reset()
                 return "reset", "Cycle Complete - Ready for Next Unit", "state_0_unstarted", "1/1"
 
@@ -173,6 +173,10 @@ class AssemblyStateMachine:
             self.skipped_step_index = None
             self.skip_streak = 0
             return "advanced", self.current_state()
+
+        # Case 2c: At Step 0, if previous completed unit is still on desk, prompt to clear workspace
+        elif self.current_index == 0 and matched_index == len(self.state_order) - 1:
+            return "holding", "Please remove completed assembly to begin next unit"
 
         # Case 3: Reverted or temporary hand occlusion - hold current step without resetting progress
         elif matched_index < self.current_index:
