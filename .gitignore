@@ -10,6 +10,7 @@ __pycache__/
 *$py.class
 *.so
 .pytest_cache/
+*.cache
 
 # Pretrained base weights (Ultralytics auto-downloads these to root)
 /yolov8*.pt
