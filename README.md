@@ -1,57 +1,58 @@
 # Block Assembly Quality Inspection System
 
-An automated Computer Vision & Deep Learning quality inspection system for multi-part toy block assembly. It combines real-time **Object Detection** (localizing individual blocks and verifying parts in hand) with **Assembly Graph Spatial Verification** (checking joints, alignments, and connections), **Whole-Structure State Classification**, and **Temporal Consensus Smoothing** to strictly enforce correct assembly order and catch manufacturing/assembly defects.
+An automated Computer Vision & Deep Learning quality inspection system for multi-part toy block assembly. It combines real-time **Object Detection** (localizing individual blocks and verifying incoming parts in hand) with **Green-Anchored Assembly Cropping**, **Macro State Classification**, **Temporal Consensus Smoothing**, and a **FastAPI Performance Dashboard Backend** to strictly enforce correct assembly order and catch assembly defects.
 
 ---
 
-## Architecture: Dual-Perception Perception + Spatial Graph
+## Architecture: Dual-Perception + Anchor Crop Pipeline
 
 ```
 Raw Camera / Video Stream (Webcam / DroidCam / Video)
                      │
-                     ▼
-   ┌───────────────────────────────────┐
-   │        ComponentDetector          │
-   │  (Dual-Perception Mutual Engine)  │
-   └───────────────────────────────────┘
-         │                       │
-         ▼                       ▼
-┌──────────────────┐    ┌──────────────────────────────┐
-│  Block Detector  │    │      Macro State Model       │
-│  (YOLOv8 Detect) │    │      (YOLOv8 Classifier)     │
-│  - Blue blocks   │    │  - Classifies Stage 0 to 8   │
-│  - Red blocks    │    │    from whole visual layout  │
-│  - Green beam    │    └──────────────────────────────┘
-│  - Yellow blocks │                     │
-└──────────────────┘                     │
-         │                               │
-         ├───────────────────────────────┤
-         ▼                               ▼
-┌──────────────────────────────────────────────┐
-│       Assembly Graph & Part Corroboration    │
-│  - Checks required part counts per stage     │
-│  - Validates physical adjacency & joints     │
-│  - Tracks incoming part in hand              │
-│    (Alerts: "VALID" vs "WRONG PART")         │
-│  - Cross-corroborates Detector + Classifier  │
-└──────────────────────────────────────────────┘
-                     │
-                     ▼
-┌──────────────────────────────────────────────┐
-│         AssemblyStateMachine                 │
-│  - 10-frame Rolling Temporal Consensus      │
-│  - Strict Sequential Progression             │
-│  - Latches RED "SEQUENCE REJECTED" on skips  │
-└──────────────────────────────────────────────┘
-                     │
-                     ▼
-┌──────────────────────────────────────────────┐
-│           Industrial Inspection HUD          │
-│  - PASS (Green) / HOLD (Slate) / REJECT (Red)│
-│  - Live 9-Step Sequential Checklist          │
-│  - Bounding Boxes & Incoming Object Badges   │
-│  - DroidCam (USB & WiFi IP) + Webcam Support │
-└──────────────────────────────────────────────┘
+                     ├─────────────────────────────────────────┐
+                     ▼                                         ▼
+      ┌─────────────────────────────┐           ┌─────────────────────────────┐
+      │      Block Detector         │           │        Block Cropper        │
+      │      (YOLOv8/11 Detect)     │           │   (Green-Anchored Filter)   │
+      │  - Blue base feet           │           │  - Finds green spine anchor │
+      │  - Red stack & head         │           │  - Extracts focused 384px   │
+      │  - Yellow connectors/crown  │           │    assembly crop ROI        │
+      │  - Tracks part in hand      │           └──────────────┬──────────────┘
+      └──────────────┬──────────────┘                          │
+                     │                                         ▼
+                     │                          ┌─────────────────────────────┐
+                     │                          │    Macro State Classifier   │
+                     │                          │   (YOLOv8/11-cls @ 384px)   │
+                     │                          │  - Classifies Stage 0 to 8  │
+                     │                          │    from clean focused crop  │
+                     │                          └──────────────┬──────────────┘
+                     │                                         │
+                     └────────────────────┬────────────────────┘
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │       ComponentDetector         │
+                         │  - Dual-Perception Fusion       │
+                         │  - Validates part in hand       │
+                         │    ("VALID" vs "WRONG PART")    │
+                         └────────────────┬────────────────┘
+                                          │
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │      AssemblyStateMachine       │
+                         │  - 10-frame Rolling Consensus   │
+                         │  - Hand-Stillness Protection    │
+                         │  - Enforces 0 -> 8 Sequence     │
+                         └────────────────┬────────────────┘
+                                          │
+                 ┌────────────────────────┴────────────────────────┐
+                 ▼                                                 ▼
+┌─────────────────────────────────┐               ┌─────────────────────────────────┐
+│     Industrial Inspection HUD   │               │   FastAPI Performance Dashboard │
+│  - PASS / ASSEMBLING / REJECT   │   (Optional   │   - PostgreSQL / Supabase sync  │
+│  - Live 9-Step Checklist        │  Background   │   - Operator cycle tracking     │
+│  - Real-time FPS & Latency      │   Streaming)  │   - Real-time event analytics   │
+│  - Picture-in-Picture Crop Inset│ ────────────> │   - Defect rate reporting       │
+└─────────────────────────────────┘               └─────────────────────────────────┘
 ```
 
 ---
@@ -72,71 +73,89 @@ Raw Camera / Video Stream (Webcam / DroidCam / Video)
 
 ---
 
+## Quick Setup
+
+### 1. Prerequisites
+- Python 3.10 to 3.12 (or 3.14)
+- Webcam, DroidCam phone camera, or recorded video files
+
+### 2. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+---
+
 ## How to Run
 
-### 1. Unified Interactive Menu
+### Option A: Interactive Launcher Menu
 ```bash
 python main.py
 ```
 
-### 2. Step-by-Step CLI Commands
-
-#### Step A: Extract Frames from Videos
-Extracts frames from all 12 dataset videos in `DATASET/` with Laplacian blur filtering and an 80/20 train/val temporal split:
-```bash
-python extract_frames.py
-```
-
-#### Step B: Generate Datasets & Labels
-Generates:
-- `yolo_dataset_det/`: Object detection dataset with auto-generated YOLO bounding box labels
-- `yolo_dataset_cls/`: State classification dataset split into stage folders
-```bash
-python prepare_dataset.py
-```
-
-#### Step C: Train Models
-Train the YOLOv8 Object Detector:
-```bash
-python train_detector.py --epochs 60 --model yolov8s.pt
-```
-
-Train the YOLOv8 State Classifier:
-```bash
-python train_classifier.py --epochs 60 --model yolov8s-cls.pt
-```
-
-#### Step D: Run Benchmark Evaluation
-Evaluates accuracy on held-out validation frames:
-```bash
-python evaluate.py
-```
-
-#### Step E: Live Inspection HUD
-Launch the real-time HUD with webcam:
+### Option B: Live Inspection HUD
+Launch the real-time HUD (auto-detects working camera):
 ```bash
 python live_demo.py
 ```
 
-Or connect via external DroidCam:
+Connect via external USB or DroidCam:
 ```bash
-# Using DroidCam via USB/PC Client:
+# Using DroidCam via USB/PC Client (index 1 or 2):
 python live_demo.py --camera 1
 
 # Using DroidCam via direct WiFi IP URL:
 python live_demo.py --camera http://<PHONE_IP>:4747/video
 ```
 
-Or test on one of the recorded dataset videos:
+Test on a recorded video:
 ```bash
 python live_demo.py --video "DATASET/state8_complete.mp4"
 ```
 
-Or inspect a single image:
+Inspect a single image:
 ```bash
 python live_demo.py --image "demo_output.jpg"
 ```
 
-### Live Controls:
-- **`r`**: Reset sequence tracker back to Step 0.
-- **`q`**: Quit the inspection window.
+#### Live HUD Controls:
+- **`r` / Space**: Reset sequence tracker back to Step 0.
+- **`s`**: Save an inspection snapshot and pristine raw image to `snapshots/`.
+- **`q` / Esc**: Quit.
+
+---
+
+## Connect to the Performance Dashboard Backend
+
+To stream live inspection events, cycle start/end, and pass/fail statistics to the FastAPI backend:
+
+1. **Start the FastAPI backend** in a separate terminal:
+   ```bash
+   cd backend
+   pip install -r requirements.txt
+   uvicorn main:app --reload --port 8000
+   ```
+
+2. **Launch the Live HUD with the dashboard bridge**:
+   ```bash
+   python live_demo.py --dashboard http://localhost:8000 --operator OP001
+   ```
+
+---
+
+## How to Retrain the Cropped State Classifier (GPU Laptop)
+
+1. Generate or verify the cropped training dataset:
+   ```bash
+   python prepare_cropped_dataset.py
+   ```
+
+2. Train the state classifier (runs in ~6–8 mins on an RTX 4050):
+   ```bash
+   python train_classifier.py --epochs 60 --model yolo11s-cls.pt --batch 16
+   ```
+
+3. Benchmark validation accuracy and latency:
+   ```bash
+   python evaluate.py
+   ```

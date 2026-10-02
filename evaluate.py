@@ -10,6 +10,7 @@ Usage:
 """
 
 import os
+import time
 import cv2
 from component_detector import ComponentDetector
 from block_config import EXTRACTED_DIR, ASSEMBLY_STATES, STEP_TITLES
@@ -27,6 +28,7 @@ def evaluate_states(detector):
 
     total_frames = 0
     correct_frames = 0
+    latencies = []
     state_results = {}
 
     STATE_DIR_MAP = {
@@ -59,7 +61,9 @@ def evaluate_states(detector):
             if img is None:
                 continue
 
+            t0 = time.perf_counter()
             res = detector.analyze(img, current_step_index=step_idx)
+            latencies.append((time.perf_counter() - t0) * 1000.0)
             pred = res["predicted_state"]
 
             if pred == mapped_state:
@@ -75,8 +79,11 @@ def evaluate_states(detector):
         print(f"  {title:<32}: {s_correct:>3}/{s_total:<3} ({acc:>5.1f}%)")
 
     overall_acc = (correct_frames / total_frames) * 100.0 if total_frames > 0 else 0.0
+    avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
+    avg_fps = 1000.0 / avg_lat if avg_lat > 0 else 0.0
     print("-" * 72)
     print(f"  Overall Validation Accuracy: {correct_frames}/{total_frames} ({overall_acc:.1f}%)")
+    print(f"  Average Pipeline Latency:    {avg_lat:.1f} ms/frame (~{avg_fps:.1f} FPS)")
     print("=" * 72)
 
 

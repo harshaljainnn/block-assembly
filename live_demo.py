@@ -2,21 +2,24 @@
 Live Visual Assembly Checker for Block Assembly Quality Inspection.
 Combines:
   - Real-time Object Detection (bounding boxes & incoming block tracking)
-  - Assembly Graph Spatial Verification (relative positions & connections)
-  - Dual-Perception Corroboration & Incoming Part Validator
-  - State Machine Strict Sequential Enforcement & Temporal Smoothing HUD
+  - Focused Assembly Cropping (Green-beam anchor with Picture-in-Picture display)
+  - State Machine Strict Sequential Enforcement & Temporal Consensus Smoothing
+  - Hand-Stillness Protection (tolerant to in-flight hand placement)
+  - Optional non-blocking FastAPI Dashboard Bridge for live performance tracking
 
 Usage:
-    python live_demo.py                             # Default built-in webcam (index 0)
-    python live_demo.py --camera 1                  # External USB / DroidCam PC client
-    python live_demo.py --camera http://<IP>:4747/video # DroidCam WiFi IP stream
-    python live_demo.py --video <path_to_video.mp4> # Test on recorded video
-    python live_demo.py --image <path_to_image.jpg> # Inspect single image
+    python live_demo.py                                     # Auto-detects working webcam
+    python live_demo.py --camera 1                          # External USB / DroidCam PC client
+    python live_demo.py --camera http://<IP>:4747/video     # DroidCam WiFi IP stream
+    python live_demo.py --video <path_to_video.mp4>         # Test on recorded video
+    python live_demo.py --image <path_to_image.jpg>         # Inspect single image
+    python live_demo.py --dashboard http://localhost:8000   # Stream events to FastAPI dashboard
 """
 
 import os
 import time
 import argparse
+import threading
 import cv2
 import numpy as np
 
@@ -25,17 +28,99 @@ from state_machine import AssemblyStateMachine
 from block_config import BLOCK_COLORS_BGR, STEP_TITLES
 
 
-def draw_hud(frame, result, state_machine, smoothed=True):
+class DashboardBridge:
+    """
+    Non-blocking background bridge that posts real-time assembly events
+    to the teammate's FastAPI performance dashboard backend (backend/main.py).
+    """
+
+    def __init__(self, api_url=None, operator_id="OP001", api_key=""):
+        self.api_url = api_url.rstrip("/") if api_url else None
+        self.operator_id = operator_id
+        self.api_key = api_key
+        self.cycle_id = None
+        self.enabled = bool(self.api_url)
+
+    def _async_post(self, endpoint, data):
+        if not self.enabled:
+            return
+
+        def worker():
+            try:
+                import requests
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["x-cv-api-key"] = self.api_key
+                url = f"{self.api_url}{endpoint}"
+                requests.post(url, json=data, headers=headers, timeout=2.0)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_cycle(self):
+        if not self.enabled:
+            return
+
+        def worker():
+            try:
+                import requests
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["x-cv-api-key"] = self.api_key
+                url = f"{self.api_url}/api/assembly/start"
+                resp = requests.post(url, json={"operator_id": self.operator_id}, headers=headers, timeout=2.0)
+                if resp.ok:
+                    res_json = resp.json()
+                    self.cycle_id = res_json.get("assembly", {}).get("cycle_id")
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def log_event(self, state_index, state_name, status, confidence=1.0, diagnostic=""):
+        if not self.enabled or not self.cycle_id:
+            return
+        self._async_post(
+            "/api/assembly/event",
+            {
+                "cycle_id": self.cycle_id,
+                "state_index": state_index,
+                "state_name": state_name,
+                "status": status,
+                "confidence": float(confidence),
+                "diagnostic": diagnostic,
+            },
+        )
+
+    def end_cycle(self, status="pass", completed=8):
+        if not self.enabled or not self.cycle_id:
+            return
+        cid = self.cycle_id
+        self.cycle_id = None
+        self._async_post(
+            "/api/assembly/end",
+            {
+                "cycle_id": cid,
+                "status": status,
+                "states_completed": completed,
+            },
+        )
+
+
+def draw_hud(frame, result, state_machine, smoothed=True, fps=None):
     """
     Renders an industrial quality inspection HUD onto the camera frame.
     Displays:
       - Bounding boxes around all detected blocks
+      - Focused assembly crop bounding box
       - Incoming object callout (highlighting part in hand)
       - Top status banner (PASS / ADVANCED / HOLDING / ERROR)
       - Right-hand sequential assembly checklist (all 9 steps)
+      - Picture-in-Picture (PiP) inset of the cropped assembly
+      - Real-time FPS and latency counter
     """
     h, w = frame.shape[:2]
-    overlay = frame.copy()
 
     state = result.get("predicted_state", "state_0_unstarted")
     conf = result.get("confidence", 0.0)
@@ -63,10 +148,8 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         dconf = d["confidence"]
         box_col = BLOCK_COLORS_BGR.get(cname, (200, 200, 200))
 
-        # Box
         cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), box_col, 2)
 
-        # Label badge with high-contrast text (black for yellow, white for others)
         lbl = f"{cname.replace('_block', '')} {dconf*100:.0f}%"
         text_col = (0, 0, 0) if cname == "yellow_block" else (255, 255, 255)
         (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
@@ -75,19 +158,24 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         cv2.rectangle(frame, (bx, badge_y1), (bx + tw + 6, badge_y2), box_col, -1)
         cv2.putText(frame, lbl, (bx + 3, badge_y2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_col, 1)
 
-    # 2. Highlight Incoming Object (Part in Hand)
+    # 2. Highlight Assembly ROI Box
+    crop_bbox = result.get("crop_bbox")
+    if crop_bbox and crop_bbox[2] > 0 and crop_bbox[3] > 0 and not is_error:
+        cx, cy, cw, ch = crop_bbox
+        cv2.rectangle(frame, (cx, cy), (cx + cw, cy + ch), (0, 200, 220), 1)
+
+    # 3. Highlight Incoming Object (Part in Hand)
     incoming = result.get("incoming_object")
     if incoming:
         ix, iy, iw, ih = incoming["bbox"]
         is_exp = incoming["is_expected"]
         badge_col = (0, 220, 0) if is_exp else (0, 0, 255)
 
-        # Pulsing / Thick border around incoming part
         cv2.rectangle(frame, (ix - 3, iy - 3), (ix + iw + 3, iy + ih + 3), badge_col, 3)
         tag = "[INCOMING: VALID]" if is_exp else "[INCOMING: WRONG PART!]"
         cv2.putText(frame, tag, (ix, max(25, iy - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, badge_col, 2)
 
-    # 3. Top Status Banner
+    # 4. Top Status Banner
     header_h = 160
     if is_error:
         header_color = (20, 20, 160)   # Crimson Red
@@ -106,7 +194,6 @@ def draw_hud(frame, result, state_machine, smoothed=True):
     else:
         header_color = (22, 22, 22)    # Industrial Dark Slate
 
-    # Apply semi-transparent header bar directly to ROI
     sub_header = frame[0:header_h, 0:w]
     header_bg = np.full(sub_header.shape, header_color, dtype=np.uint8)
     frame[0:header_h, 0:w] = cv2.addWeighted(sub_header, 0.12, header_bg, 0.88, 0)
@@ -122,7 +209,7 @@ def draw_hud(frame, result, state_machine, smoothed=True):
     chk_bg = np.full(sub_chk.shape, (10, 10, 10), dtype=np.uint8)
     frame[4:header_h - 4, max(0, start_x - 6):w - 4] = cv2.addWeighted(sub_chk, 0.20, chk_bg, 0.80, 0)
 
-    # Left Side Info
+    # Left Side Status Text
     if is_error:
         cv2.putText(frame, "SEQUENCE REJECTED!", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
         err_msg = detail or state_machine.error_detail or diagnostic or "Sequence defect detected"
@@ -173,25 +260,25 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         st = s["status"]
         if st in ["verified", "current_passed"]:
             tag = "[PASS] "
-            col = (60, 235, 60)   # Bright Green
+            col = (60, 235, 60)
         elif st == "next":
             tag = "[NEXT] "
-            col = (240, 210, 40)  # Cyan/Gold for next target step
+            col = (240, 210, 40)
         elif st == "error_current":
             tag = "[ERR ] "
-            col = (40, 40, 255)   # Red
+            col = (40, 40, 255)
         elif st == "current":
             tag = "[NOW ] "
-            col = (200, 200, 200) # Neutral
+            col = (200, 200, 200)
         else:
             tag = "[    ] "
-            col = (110, 110, 110) # Dim Gray
+            col = (110, 110, 110)
 
         title = s["title"].split(". ", 1)[-1]
         text = f"{tag}{i}.{title[:14]}"
         cv2.putText(frame, text, (start_x, 18 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1)
 
-    # 4. Flash banner if reset just occurred
+    # 5. Flash banner if reset just occurred
     if getattr(state_machine, "reset_flash", 0) > 0:
         state_machine.reset_flash -= 1
         b_h = 50
@@ -204,10 +291,10 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         tx = max(10, int((w - tw) / 2))
         cv2.putText(frame, msg, (tx, by1 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
 
-    # 5. Bottom control bar & clickable buttons
+    # 6. Bottom control bar & clickable buttons
     bar_h = 32
 
-    # 4b. Picture-in-Picture (PiP) inset for the Cropped Assembly ROI
+    # Picture-in-Picture (PiP) inset for the Cropped Assembly ROI
     crop_img = result.get("crop")
     if crop_img is not None and crop_img.size > 0:
         pip_size = 110
@@ -223,6 +310,11 @@ def draw_hud(frame, result, state_machine, smoothed=True):
 
     cv2.rectangle(frame, (0, h - bar_h), (w, h), (20, 20, 20), -1)
     cv2.putText(frame, "[R/Space] Reset  |  [S] Snapshot  |  [Q] Quit", (12, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
+
+    # Live FPS readout on bottom bar
+    if fps is not None:
+        ms = 1000.0 / max(fps, 1e-3)
+        cv2.putText(frame, f"FPS: {fps:.1f} ({ms:.0f}ms)", (int(w * 0.42), h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 240, 220), 1)
 
     # Clickable Buttons:
     btn_r_x1 = max(w - 230, int(w * 0.65))
@@ -256,12 +348,34 @@ def run_image(image_path, detector, sm):
     print(f"Annotated result saved to '{out_path}'")
 
 
-def run_video(video_source, detector, sm):
-    if isinstance(video_source, str) and video_source.isdigit():
-        video_source = int(video_source)
+def open_working_camera(requested_source):
+    """
+    Attempts to open the requested camera, falling back to alternative device indices (0, 1, 2)
+    if index 0 is unavailable or busy.
+    """
+    if isinstance(requested_source, str) and not requested_source.isdigit():
+        cap = cv2.VideoCapture(requested_source)
+        if cap.isOpened():
+            return cap, requested_source
+        return None, requested_source
 
-    cap = cv2.VideoCapture(video_source)
-    if not cap.isOpened():
+    requested_idx = int(requested_source) if isinstance(requested_source, str) else requested_source
+    candidate_indices = [requested_idx] + [i for i in [0, 1, 2] if i != requested_idx]
+
+    for idx in candidate_indices:
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                return cap, idx
+            cap.release()
+
+    return None, requested_source
+
+
+def run_video(video_source, detector, sm, dashboard=None):
+    cap, active_src = open_working_camera(video_source)
+    if cap is None:
         print(f"[ERROR] Could not open video source: {video_source}")
         print("Tip: If using DroidCam client, try device index 1 or 2:")
         print("     python live_demo.py --camera 1")
@@ -269,8 +383,11 @@ def run_video(video_source, detector, sm):
         print("     python live_demo.py --camera http://<PHONE_IP>:4747/video")
         return
 
-    print(f"\nLive Inspection started on [{video_source}].")
+    print(f"\nLive Inspection active on camera [{active_src}].")
     print("Controls: 'r'/Space = Reset, 's' = Snapshot, 'q'/Esc = Quit. (Or click on-screen buttons)")
+    if dashboard and dashboard.enabled:
+        print(f"Dashboard Bridge connected to: {dashboard.api_url}")
+        dashboard.start_cycle()
 
     window_name = "Block Assembly Checker (Live HUD)"
     button_events = {"reset": False, "snap": False}
@@ -294,16 +411,38 @@ def run_video(video_source, detector, sm):
     mouse_param = {"w": 640, "h": 480}
     cv2.setMouseCallback(window_name, on_mouse, mouse_param)
 
+    prev_time = time.perf_counter()
+    prev_state_idx = -1
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        curr_time = time.perf_counter()
+        dt = curr_time - prev_time
+        prev_time = curr_time
+        fps = (1.0 / dt) if dt > 0 else 30.0
+
         mouse_param["w"] = frame.shape[1]
         mouse_param["h"] = frame.shape[0]
 
         res = detector.analyze(frame, current_step_index=sm.current_index)
-        annotated = draw_hud(frame.copy(), res, sm, smoothed=True)
+        annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps)
+
+        # Log state advancements or errors to Dashboard backend if connected
+        if dashboard and dashboard.enabled:
+            if sm.current_index != prev_state_idx:
+                prev_state_idx = sm.current_index
+                dashboard.log_event(
+                    state_index=sm.current_index,
+                    state_name=sm.current_state(),
+                    status="completed" if sm.is_complete() else "advanced",
+                    confidence=res["confidence"],
+                    diagnostic=res.get("diagnostic", ""),
+                )
+                if sm.is_complete():
+                    dashboard.end_cycle(status="pass", completed=8)
 
         cv2.imshow(window_name, annotated)
 
@@ -318,13 +457,16 @@ def run_video(video_source, detector, sm):
             break
         elif do_reset:
             sm.reset()
+            prev_state_idx = -1
+            if dashboard and dashboard.enabled:
+                dashboard.start_cycle()
             print("[INFO] Sequence tracker reset to Step 0.")
         elif do_snap:
-            os.makedirs("errors", exist_ok=True)
+            os.makedirs("snapshots", exist_ok=True)
             ts = int(time.time())
-            snap_path = f"errors/live_snapshot_{ts}.jpg"
+            snap_path = f"snapshots/snapshot_{ts}.jpg"
             cv2.imwrite(snap_path, annotated)
-            raw_path = f"errors/live_raw_{ts}.jpg"
+            raw_path = f"snapshots/raw_{ts}.jpg"
             cv2.imwrite(raw_path, frame)
             print(f"[INFO] Saved snapshot to '{snap_path}' and '{raw_path}'")
 
@@ -337,17 +479,20 @@ def main():
     parser.add_argument("--image", type=str, default=None, help="Inspect a single image file")
     parser.add_argument("--video", type=str, default=None, help="Run inspection on a recorded video file")
     parser.add_argument("--camera", type=str, default="0", help="Webcam index (0, 1) or IP URL")
+    parser.add_argument("--dashboard", type=str, default=None, help="Optional FastAPI dashboard backend URL (e.g. http://localhost:8000)")
+    parser.add_argument("--operator", type=str, default="OP001", help="Operator ID for dashboard session (default: OP001)")
     args = parser.parse_args()
 
     detector = ComponentDetector()
     sm = AssemblyStateMachine()
+    dashboard = DashboardBridge(api_url=args.dashboard, operator_id=args.operator) if args.dashboard else None
 
     if args.image:
         run_image(args.image, detector, sm)
     elif args.video:
-        run_video(args.video, detector, sm)
+        run_video(args.video, detector, sm, dashboard=dashboard)
     else:
-        run_video(args.camera, detector, sm)
+        run_video(args.camera, detector, sm, dashboard=dashboard)
 
 
 if __name__ == "__main__":
