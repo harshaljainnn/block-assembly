@@ -73,6 +73,7 @@ LOCAL_EVENTS = []    # list of event dicts
 
 LATEST_HUD_FRAME: Optional[bytes] = None
 LATEST_FRAME_TIME: float = 0.0
+LATEST_ACTIVE_CYCLE_ID: Optional[str] = None
 DAILY_GOAL: int = 50
 
 
@@ -434,6 +435,9 @@ def assembly_event(
     # Local Mode Execution
     # --------------------------------------------------------
     if USE_LOCAL_MODE:
+        global LATEST_ACTIVE_CYCLE_ID
+        LATEST_ACTIVE_CYCLE_ID = data.cycle_id
+
         session = LOCAL_SESSIONS.get(data.cycle_id)
         if not session:
             cycle_number = len(LOCAL_SESSIONS) + 1
@@ -478,18 +482,17 @@ def assembly_event(
         }
         LOCAL_EVENTS.append(event_record)
 
-        current_completed = session.get("states_completed") or 0
-        new_completed = current_completed
-        if data.status in ["advanced", "completed", "holding"] and data.state_index is not None:
-            new_completed = max(current_completed, data.state_index)
-            session["states_completed"] = new_completed
-        session["current_state_index"] = data.state_index
+        if data.state_index is not None:
+            session["states_completed"] = data.state_index
+            session["current_state_index"] = data.state_index
+        else:
+            session["states_completed"] = session.get("states_completed", 0)
 
         return {
             "success": True,
             "cycle_id": data.cycle_id,
             "event_id": event_id,
-            "states_completed": new_completed,
+            "states_completed": session["states_completed"],
         }
 
     # --------------------------------------------------------
@@ -815,8 +818,27 @@ def get_events(cycle_id: Optional[str] = None):
 def get_latest():
     if USE_LOCAL_MODE:
         sessions = list(LOCAL_SESSIONS.values())
-        latest_session = sessions[-1] if sessions else None
         latest_event = LOCAL_EVENTS[-1] if LOCAL_EVENTS else None
+
+        active_cid = None
+        if latest_event and latest_event.get("cycle_id") in LOCAL_SESSIONS:
+            active_cid = latest_event["cycle_id"]
+        elif LATEST_ACTIVE_CYCLE_ID and LATEST_ACTIVE_CYCLE_ID in LOCAL_SESSIONS:
+            active_cid = LATEST_ACTIVE_CYCLE_ID
+
+        if active_cid and active_cid in LOCAL_SESSIONS:
+            latest_session = LOCAL_SESSIONS[active_cid]
+        elif sessions:
+            latest_session = sessions[-1]
+        else:
+            latest_session = None
+
+        current_step = 0
+        if latest_event and latest_event.get("state_index") is not None:
+            current_step = latest_event["state_index"]
+        elif latest_session and latest_session.get("states_completed") is not None:
+            current_step = latest_session["states_completed"]
+
         passes = sum(1 for s in sessions if s.get("status") == "pass")
         fails = sum(1 for s in sessions if s.get("status") == "fail")
         total = len(sessions)
@@ -840,6 +862,7 @@ def get_latest():
         return {
             "session": latest_session,
             "latest_event": latest_event,
+            "current_step": current_step,
             "total_cycles": total,
             "active_cycle_number": active_cycle_number,
             "cycles_done_today": cycles_done_today,
@@ -1335,54 +1358,55 @@ def dashboard_ui():
           }
 
           // 2. Handle Cycle Status & Sequential Checklist Auto-Reset
-          if (sess) {
-            const isCompletedCycle = (sess.status === "pass" || sess.status === "completed" || (sess.states_completed === 8 && sess.status !== "in_progress"));
+          const isCompletedCycle = sess && (sess.status === "pass" || sess.status === "completed" || (sess.states_completed === 8 && sess.status !== "in_progress"));
 
-            if (isCompletedCycle) {
-              // Completed state: show 8/8 done and schedule auto-reset for next unit
-              document.getElementById("stat-step-num").innerText = "8";
-              document.getElementById("stat-step-bar").style.width = "100%";
-              document.getElementById("stat-cycle-status-text").innerText = "Cycle Completed (PASS)";
-              document.getElementById("current-state-title").innerText = "8. Complete 9-Part Assembly (PASS)";
-              renderSteps(8);
+          if (isCompletedCycle) {
+            // Completed state: show 8/8 done and schedule auto-reset for next unit
+            document.getElementById("stat-step-num").innerText = "8";
+            document.getElementById("stat-step-bar").style.width = "100%";
+            document.getElementById("stat-cycle-status-text").innerText = "Cycle Completed (PASS)";
+            document.getElementById("current-state-title").innerText = "8. Complete 9-Part Assembly (PASS)";
+            renderSteps(8);
 
-              if (lastCompletedCycleId !== sess.cycle_id) {
-                lastCompletedCycleId = sess.cycle_id;
-                autoResetCountdown = 4;
+            if (lastCompletedCycleId !== sess.cycle_id) {
+              lastCompletedCycleId = sess.cycle_id;
+              autoResetCountdown = 4;
 
-                const banner = document.getElementById("diagnostic-banner");
-                banner.className = "bg-emerald-950/40 border border-emerald-500/60 rounded-2xl p-5 flex items-start gap-4 ring-2 ring-emerald-500/30";
-                document.getElementById("banner-icon").className = "p-3 bg-emerald-500/20 text-emerald-400 rounded-xl text-xl shrink-0";
-                document.getElementById("banner-icon").innerHTML = '<i class="fa-solid fa-trophy"></i>';
-                document.getElementById("banner-status").className = "text-sm font-bold uppercase tracking-wider text-emerald-400";
-                document.getElementById("banner-status").innerText = "CYCLE COMPLETE & VERIFIED (PASS)";
-                document.getElementById("banner-text").innerText = `Assembly unit verified successfully! Resetting checklist for next unit in ${autoResetCountdown}s...`;
+              const banner = document.getElementById("diagnostic-banner");
+              banner.className = "bg-emerald-950/40 border border-emerald-500/60 rounded-2xl p-5 flex items-start gap-4 ring-2 ring-emerald-500/30";
+              document.getElementById("banner-icon").className = "p-3 bg-emerald-500/20 text-emerald-400 rounded-xl text-xl shrink-0";
+              document.getElementById("banner-icon").innerHTML = '<i class="fa-solid fa-trophy"></i>';
+              document.getElementById("banner-status").className = "text-sm font-bold uppercase tracking-wider text-emerald-400";
+              document.getElementById("banner-status").innerText = "CYCLE COMPLETE & VERIFIED (PASS)";
+              document.getElementById("banner-text").innerText = `Assembly unit verified successfully! Resetting checklist for next unit in ${autoResetCountdown}s...`;
 
-                if (autoResetTimer) clearInterval(autoResetTimer);
-                autoResetTimer = setInterval(async () => {
-                  autoResetCountdown--;
-                  if (autoResetCountdown > 0) {
-                    document.getElementById("banner-text").innerText = `Assembly unit verified successfully! Resetting checklist for next unit in ${autoResetCountdown}s...`;
-                  } else {
-                    clearInterval(autoResetTimer);
-                    autoResetTimer = null;
-                    await triggerResetCycle();
-                  }
-                }, 1000);
-              }
-            } else {
-              // In progress cycle
-              if (autoResetTimer) {
-                clearInterval(autoResetTimer);
-                autoResetTimer = null;
-              }
-              const completed = sess.states_completed !== undefined ? sess.states_completed : 0;
-              document.getElementById("stat-step-num").innerText = completed;
-              document.getElementById("stat-step-bar").style.width = `${Math.min(100, (completed / 8) * 100)}%`;
-              document.getElementById("stat-cycle-status-text").innerText = `Step ${completed} / 8 In Progress`;
-              document.getElementById("current-state-title").innerText = STEP_NAMES[completed] || `Step ${completed}`;
-              renderSteps(completed);
+              if (autoResetTimer) clearInterval(autoResetTimer);
+              autoResetTimer = setInterval(async () => {
+                autoResetCountdown--;
+                if (autoResetCountdown > 0) {
+                  document.getElementById("banner-text").innerText = `Assembly unit verified successfully! Resetting checklist for next unit in ${autoResetCountdown}s...`;
+                } else {
+                  clearInterval(autoResetTimer);
+                  autoResetTimer = null;
+                  await triggerResetCycle();
+                }
+              }, 1000);
             }
+          } else {
+            // In progress cycle or active events
+            if (autoResetTimer) {
+              clearInterval(autoResetTimer);
+              autoResetTimer = null;
+            }
+            const activeStep = (latestData.current_step !== undefined)
+              ? latestData.current_step
+              : ((evt && evt.state_index !== undefined) ? evt.state_index : (sess ? (sess.states_completed || 0) : 0));
+
+            document.getElementById("stat-step-num").innerText = activeStep;
+            document.getElementById("stat-step-bar").style.width = `${Math.min(100, (activeStep / 8) * 100)}%`;
+            document.getElementById("stat-cycle-status-text").innerText = `Step ${activeStep} / 8 In Progress`;
+            document.getElementById("current-state-title").innerText = STEP_NAMES[activeStep] || `Step ${activeStep}`;
+            renderSteps(activeStep);
           }
 
           // 3. Update Overall Metrics
