@@ -480,18 +480,25 @@ class ComponentDetector:
         is_valid = graph_eval["is_valid"]
         diagnostic = graph_eval["diagnostic"]
 
-        # Dual-Perception: Corroborate with classifier ONLY if physically validated and not overriding an invalid check
-        if cls_pred is not None and is_valid:
-            if graph_eval["inferred_state"] == cls_pred:
-                conf = min(0.99, max(conf, (conf + cls_conf) / 2.0))
-            elif cls_pred == "state_8_complete" and current_step_index == 7:
-                # Macro classifier recognizes the complete 9-part figure at Step 7: advance to Step 8!
-                inferred_state = "state_8_complete"
-                conf = max(conf, cls_conf)
-                diagnostic = "PASS: Complete 9-part block figure verified!"
-            elif cls_conf >= 0.80 and cls_pred == target_state:
+        # Dual-Perception: Corroborate with classifier
+        if cls_pred is not None:
+            # 1. High-confidence cropped classifier corroboration for target state
+            # Prevents 2D bounding-box false alarms (e.g. slight tilt/occlusion) from blocking valid states
+            if cls_conf >= 0.85 and cls_pred == target_state:
                 inferred_state = cls_pred
-                conf = cls_conf
+                conf = max(conf, cls_conf)
+                is_valid = True
+                diagnostic = f"PASS: {target_state} verified by cropped inspection ({cls_conf*100:.1f}%)"
+            elif is_valid:
+                if graph_eval["inferred_state"] == cls_pred:
+                    conf = min(0.99, max(conf, (conf + cls_conf) / 2.0))
+                elif cls_pred == "state_8_complete" and current_step_index == 7 and graph_eval["inferred_state"] == "state_8_complete":
+                    inferred_state = "state_8_complete"
+                    conf = max(conf, cls_conf)
+                    diagnostic = "PASS: Complete 9-part block figure verified!"
+                elif cls_conf >= 0.80 and cls_pred == target_state:
+                    inferred_state = cls_pred
+                    conf = cls_conf
 
         # 7. Incoming Object Callout
         incoming_info = None
