@@ -234,22 +234,16 @@ class BlockDetector:
         split_pos = None
 
         # Check conditions for double red block:
-        # Require strong edge contrast and aspect ratio / area indicative of two stacked blocks
-        if ch >= 1.35 * cw and (r_contrast >= 1.80 or (area >= 20000 and r_contrast >= 1.60 and r_ratio >= 1.80)):
+        # Require strong edge contrast and aspect ratio indicative of two stacked blocks (aspect >= 1.70)
+        # Never split a single 2x2 block (aspect ~1.0 - 1.35)
+        if ch >= 1.70 * cw and r_contrast >= 2.0 and r_ratio >= 1.90:
             split_axis = "horizontal"
             split_pos = best_r
 
-        elif cw >= 1.35 * ch and (c_contrast >= 1.80 or (area >= 20000 and c_contrast >= 1.60 and c_ratio >= 1.80)):
+        elif cw >= 1.70 * ch and c_contrast >= 2.0 and c_ratio >= 1.90:
             split_axis = "vertical"
             split_pos = best_c
 
-        elif area >= 25000 and aspect >= 1.20:
-            if r_contrast >= 1.80 and r_peak >= c_peak:
-                split_axis = "horizontal"
-                split_pos = best_r
-            elif c_contrast >= 1.80 and c_peak > r_peak:
-                split_axis = "vertical"
-                split_pos = best_c
 
         # Execute horizontal split
         if split_axis == "horizontal" and split_pos is not None:

@@ -45,8 +45,8 @@ def are_adjacent(boxA, boxB, max_gap=28):
 
 def are_stacked(boxA, boxB, gbox=None, max_gap=48):
     """
-    Checks if two blocks are stacked on top of each other (perpendicular to the spine beam if visible).
-    Differentiates a vertical column stack from horizontal side-by-side blocks.
+    Checks if two blocks are stacked on top of each other.
+    Differentiates a vertical or horizontal column stack from non-adjacent blocks.
     """
     if not are_adjacent(boxA, boxB, max_gap=max_gap):
         return False
@@ -54,14 +54,11 @@ def are_stacked(boxA, boxB, gbox=None, max_gap=48):
     cB = (boxB[0] + boxB[2] // 2, boxB[1] + boxB[3] // 2)
     dx = abs(cA[0] - cB[0])
     dy = abs(cA[1] - cB[1])
-    if gbox is not None:
-        beam_is_h = gbox[2] >= gbox[3]
-        if beam_is_h:
-            return dy >= 0.5 * min(boxA[3], boxB[3]) and dy > dx * 0.7
-        else:
-            return dx >= 0.5 * min(boxA[2], boxB[2]) and dx > dy * 0.7
-    else:
-        return (dx >= 0.5 * min(boxA[2], boxB[2]) and dx > 1.2 * dy) or (dy >= 0.5 * min(boxA[3], boxB[3]) and dy > 1.2 * dx)
+
+    is_vert_stack = (dy >= 0.40 * min(boxA[3], boxB[3])) and (dy > dx * 0.60)
+    is_horiz_stack = (dx >= 0.40 * min(boxA[2], boxB[2])) and (dx > dy * 0.60)
+    return is_vert_stack or is_horiz_stack
+
 
 
 def cluster_boxes(boxes, max_merge_dist=40):
@@ -557,7 +554,7 @@ class AssemblyGraph:
                 else:
                     # Step 5 candidate: Second Red block stacked (Torso)
                     gbox = greens[0]["bbox"] if greens else None
-                    reds_stacked = are_stacked(reds[0]["bbox"], reds[1]["bbox"], gbox=gbox, max_gap=48)
+                    reds_stacked = any(are_stacked(reds[i]["bbox"], reds[j]["bbox"], gbox=gbox, max_gap=48) for i in range(len(reds)) for j in range(i + 1, len(reds))) if len(reds) >= 2 else False
                     spatial_checks.append({"rule": "Red Torso Stacked", "passed": reds_stacked})
                     if reds_stacked:
                         return {
@@ -580,7 +577,8 @@ class AssemblyGraph:
 
             # Step 5: Both Reds stacked, waiting for 2nd Yellow block (Step 6)
             elif curr_idx == 5:
-                if len(reds) >= 3 and len(yellows) < 2:
+                full_reds = [r for r in reds if r.get("area", r["bbox"][2] * r["bbox"][3]) >= 3500]
+                if len(full_reds) >= 3 and len(yellows) < 2:
                     return {
                         "inferred_state": "state_5_bothred",
                         "confidence": 0.92,
@@ -601,7 +599,7 @@ class AssemblyGraph:
                             "spatial_checks": [{"rule": "Red Torso Stacked", "passed": False}],
                         }
                     gbox = greens[0]["bbox"] if greens else None
-                    reds_stacked = are_stacked(reds[0]["bbox"], reds[1]["bbox"], gbox=gbox, max_gap=48) if len(reds) >= 2 else False
+                    reds_stacked = any(are_stacked(reds[i]["bbox"], reds[j]["bbox"], gbox=gbox, max_gap=48) for i in range(len(reds)) for j in range(i + 1, len(reds))) if len(reds) >= 2 else False
                     spatial_checks.append({"rule": "Red Torso Stacked", "passed": reds_stacked})
                     if reds_stacked:
                         return {
@@ -616,6 +614,7 @@ class AssemblyGraph:
                         return {
                             "inferred_state": "state_5_bothred",
                             "confidence": 0.90,
+
                             "is_valid": False,
                             "diagnostic": "INCORRECT ATTACHMENT: Second Red block must be stacked directly on top of First Red block (forming the torso)",
                             "part_counts": part_counts,

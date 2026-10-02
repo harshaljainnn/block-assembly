@@ -58,7 +58,7 @@ class ComponentDetector:
     def corroborate_stacked_reds(self, detections, img, current_step_index=0, cls_pred=None):
         """
         Ensures that when the assembly is at Step 5 or beyond (where 2 red blocks are stacked in the body),
-        the body red block is properly recognized and split into TWO separate red blocks.
+        the body red block is properly recognized and split into TWO separate red blocks if YOLO detected them as 1.
         """
         is_step5_plus = (current_step_index >= 5) or (
             current_step_index >= 4 and cls_pred in [
@@ -75,27 +75,23 @@ class ComponentDetector:
         if not reds:
             return detections
 
-        # Identify body red blocks on the assembly
+        # Identify body red blocks on the assembly:
+        # Tier 1: reds directly adjacent to green beam
+        # Tier 2: reds stacked/adjacent to Tier 1 reds
+        body_reds = []
         if gbox is not None:
-            body_reds = [r for r in reds if are_adjacent(r["bbox"], gbox, max_gap=90)]
+            tier1 = [r for r in reds if are_adjacent(r["bbox"], gbox, max_gap=90)]
+            body_reds.extend(tier1)
+            tier2 = [r for r in reds if r not in body_reds and any(are_adjacent(r["bbox"], t["bbox"], max_gap=60) for t in tier1)]
+            body_reds.extend(tier2)
         else:
-            body_reds = [r for r in reds if r.get("area", 0) >= 6000]
+            body_reds = [r for r in reds if r.get("area", 0) >= 4000]
 
-        # Check if the body already has 2+ stacked/adjacent red blocks
-        body_already_split = False
+        # If the body already has 2 or more red blocks, never split again!
         if len(body_reds) >= 2:
-            for i in range(len(body_reds)):
-                for j in range(i + 1, len(body_reds)):
-                    if are_adjacent(body_reds[i]["bbox"], body_reds[j]["bbox"], max_gap=50):
-                        body_already_split = True
-                        break
-                if body_already_split:
-                    break
-
-        if body_already_split:
             return detections
 
-        target_r = max(body_reds, key=lambda x: x["area"]) if body_reds else max(reds, key=lambda x: x["area"])
+        target_r = body_reds[0] if body_reds else max(reds, key=lambda x: x["area"])
         bx, by, bw, bh = target_r["bbox"]
         h_img, w_img = img.shape[:2]
 
@@ -103,16 +99,21 @@ class ComponentDetector:
         x2, y2 = min(w_img, bx + bw), min(h_img, by + bh)
         cw, ch = x2 - x1, y2 - y1
 
-        if cw >= 25 and ch >= 25:
+        # Only split if block has proportions of 2 stacked blocks
+        target_area = target_r.get("area", cw * ch)
+        is_tall = (ch >= 1.22 * cw) or (target_area >= 13500 and ch >= 0.95 * cw)
+        is_wide = (cw >= 1.22 * ch) or (target_area >= 13500 and cw >= 0.95 * ch)
+
+        if cw >= 30 and ch >= 30 and (is_tall or is_wide):
             crop = img[y1:y2, x1:x2]
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
             if gbox is not None:
-                split_horiz = (bh >= cw) or (gbox[2] > gbox[3])
+                split_horiz = is_tall or (gbox[2] > gbox[3] and not is_wide)
             else:
-                split_horiz = (bh >= cw)
+                split_horiz = is_tall
 
-            if split_horiz and ch >= 40:
+            if split_horiz and ch >= 45:
                 sobely = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
                 r1, r2 = int(0.35 * ch), int(0.65 * ch)
                 row_sums = np.sum(sobely, axis=1) if ch > 10 else [0]
@@ -120,11 +121,11 @@ class ComponentDetector:
 
                 h1 = best_r
                 h2 = bh - h1
-                if min(h1, h2) / max(h1, h2) < 0.50:
+                if min(h1, h2) / max(h1, h2) < 0.45:
                     h1 = ch // 2
                     h2 = bh - h1
 
-                if h1 >= 20 and h2 >= 20:
+                if h1 >= 25 and h2 >= 25:
                     conf = target_r.get("confidence", 0.92)
                     cls_id = target_r.get("class_id", 2)
                     new_r1 = {
@@ -149,7 +150,7 @@ class ComponentDetector:
                     res.sort(key=lambda d: d["area"], reverse=True)
                     return res
 
-            elif not split_horiz and cw >= 40:
+            elif not split_horiz and cw >= 45:
                 sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
                 c1, c2 = int(0.35 * cw), int(0.65 * cw)
                 col_sums = np.sum(sobelx, axis=0) if cw > 10 else [0]
@@ -157,11 +158,11 @@ class ComponentDetector:
 
                 w1 = best_c
                 w2 = bw - w1
-                if min(w1, w2) / max(w1, w2) < 0.50:
+                if min(w1, w2) / max(w1, w2) < 0.45:
                     w1 = cw // 2
                     w2 = bw - w1
 
-                if w1 >= 20 and w2 >= 20:
+                if w1 >= 25 and w2 >= 25:
                     conf = target_r.get("confidence", 0.92)
                     cls_id = target_r.get("class_id", 2)
                     new_r1 = {
@@ -188,13 +189,124 @@ class ComponentDetector:
 
         return detections
 
-    def cluster_feet_along_beam(self, blue_dets, green_det=None, max_dim=230):
+
+    def split_merged_blue_feet(self, blue_dets, img, green_det=None):
+        """
+        If a single blue detection encompasses both feet along the green beam,
+        splits it into two separate foot detections.
+        """
+        if not blue_dets or img is None:
+            return blue_dets
+
+        gbox = green_det["bbox"] if green_det is not None else None
+        h_img, w_img = img.shape[:2]
+        result = []
+
+        is_vertical_beam = False
+        is_horizontal_beam = False
+        if gbox is not None:
+            gw, gh = gbox[2], gbox[3]
+            if gh >= gw * 1.2:
+                is_vertical_beam = True
+            elif gw >= gh * 1.2:
+                is_horizontal_beam = True
+
+        for bdet in blue_dets:
+            bx, by, bw, bh = bdet["bbox"]
+            x1, y1 = max(0, bx), max(0, by)
+            x2, y2 = min(w_img, bx + bw), min(h_img, by + bh)
+            cw, ch = x2 - x1, y2 - y1
+
+            split_axis = None
+            if is_vertical_beam or (not is_horizontal_beam and ch >= 1.40 * cw and ch >= 160):
+                if ch >= 1.35 * cw and ch >= 150:
+                    split_axis = "horizontal"
+            elif is_horizontal_beam or (cw >= 1.40 * ch and cw >= 160):
+                if cw >= 1.35 * ch and cw >= 150:
+                    split_axis = "vertical"
+
+            if split_axis is None or cw < 40 or ch < 40:
+                result.append(bdet)
+                continue
+
+            crop = img[y1:y2, x1:x2]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+            if split_axis == "horizontal":
+                r1, r2 = int(0.25 * ch), int(0.75 * ch)
+                sobely = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+                row_sums = np.sum(sobely, axis=1) if ch > 10 else [0]
+                best_r = r1 + int(np.argmax(row_sums[r1:r2])) if r2 > r1 else ch // 2
+                h1 = best_r
+                h2 = bh - h1
+                if min(h1, h2) / max(h1, h2) < 0.40:
+                    h1 = ch // 2
+                    h2 = bh - h1
+                if h1 >= 30 and h2 >= 30:
+                    conf = bdet.get("confidence", 0.90)
+                    result.append({
+                        "class_name": "blue_block",
+                        "class_id": 0,
+                        "bbox": (bx, by, bw, h1),
+                        "center": (bx + bw // 2, by + h1 // 2),
+                        "area": bw * h1,
+                        "confidence": conf,
+                        "source": "split_feet",
+                    })
+                    result.append({
+                        "class_name": "blue_block",
+                        "class_id": 0,
+                        "bbox": (bx, by + h1, bw, h2),
+                        "center": (bx + bw // 2, by + h1 + h2 // 2),
+                        "area": bw * h2,
+                        "confidence": conf,
+                        "source": "split_feet",
+                    })
+                    continue
+
+            elif split_axis == "vertical":
+                c1, c2 = int(0.25 * cw), int(0.75 * cw)
+                sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
+                col_sums = np.sum(sobelx, axis=0) if cw > 10 else [0]
+                best_c = c1 + int(np.argmax(col_sums[c1:c2])) if c2 > c1 else cw // 2
+                w1 = best_c
+                w2 = bw - w1
+                if min(w1, w2) / max(w1, w2) < 0.40:
+                    w1 = cw // 2
+                    w2 = bw - w1
+                if w1 >= 30 and w2 >= 30:
+                    conf = bdet.get("confidence", 0.90)
+                    result.append({
+                        "class_name": "blue_block",
+                        "class_id": 0,
+                        "bbox": (bx, by, w1, bh),
+                        "center": (bx + w1 // 2, by + bh // 2),
+                        "area": w1 * bh,
+                        "confidence": conf,
+                        "source": "split_feet",
+                    })
+                    result.append({
+                        "class_name": "blue_block",
+                        "class_id": 0,
+                        "bbox": (bx + w1, by, w2, bh),
+                        "center": (bx + w1 + w2 // 2, by + bh // 2),
+                        "area": w2 * bh,
+                        "confidence": conf,
+                        "source": "split_feet",
+                    })
+                    continue
+
+            result.append(bdet)
+
+        return result
+
+    def cluster_feet_along_beam(self, blue_dets, green_det=None, max_dim=150):
         """
         Groups blue block boxes that belong to the same physical foot.
         Because the green beam passes over/under the blue feet, each foot often produces
         separate detections for its top and bottom exposed studs/halves.
-        Enforces physical unit dimensions (max_dim <= 230 px) and spatial proximity,
-        ensuring distinct separated blocks are NEVER merged into one.
+        Enforces physical unit dimensions (max_dim <= 150 px) and spatial proximity,
+        ensuring distinct separated feet along the beam are NEVER merged into one.
         """
         if not blue_dets:
             return []
@@ -202,6 +314,9 @@ class ComponentDetector:
         # Sort by area descending so primary body is cluster anchor
         sorted_dets = sorted(blue_dets, key=lambda d: d.get("area", d["bbox"][2] * d["bbox"][3]), reverse=True)
         clusters = []
+
+        gbox = green_det["bbox"] if green_det is not None else None
+        is_horiz = (gbox[2] >= gbox[3]) if gbox is not None else True
 
         for d in sorted_dets:
             b = d["bbox"]
@@ -225,29 +340,20 @@ class ComponentDetector:
                 if uw > max_dim or uh > max_dim:
                     continue
 
-                # Adjacency or overlap check
-                dx = max(0, max(bx - (cx + cw), cx - (bx + bw)))
-                dy = max(0, max(by - (cy + ch), cy - (by + bh)))
-
-                # If separated by large gap, never merge
-                if dx > 40 and dy > 40:
-                    continue
-
                 can_merge = False
-                if compute_iou(b, cb) > 0.05:
+                # Significant overlap of same foot
+                if compute_iou(b, cb) > 0.20:
                     can_merge = True
-                elif dx <= 25 and dy <= 45:
-                    can_merge = True
-                elif dy <= 25 and dx <= 45:
-                    can_merge = True
-                elif green_det is not None:
+                elif gbox is not None:
                     # Foot split across the green beam (top stud and bottom stud of the same foot)
-                    gbox = green_det["bbox"]
-                    is_horiz = gbox[2] >= gbox[3]
-                    if is_horiz and abs(bcx - ccx) <= 45 and dy <= 95:
-                        can_merge = True
-                    elif (not is_horiz) and abs(bcy - ccy) <= 45 and dx <= 95:
-                        can_merge = True
+                    if is_horiz:
+                        # Beam is horizontal: same foot means matching X coordinate along beam
+                        if abs(bcx - ccx) <= 55 and uw <= 140 and (y1 <= gbox[1] + gbox[3] + 25 and y2 >= gbox[1] - 25):
+                            can_merge = True
+                    else:
+                        # Beam is vertical: same foot means matching Y coordinate along beam
+                        if abs(bcy - ccy) <= 55 and uh <= 140 and (x1 <= gbox[0] + gbox[2] + 25 and x2 >= gbox[0] - 25):
+                            can_merge = True
 
                 if can_merge:
                     c["bbox"] = (x1, y1, uw, uh)
@@ -277,12 +383,32 @@ class ComponentDetector:
                 "confidence": c["confidence"],
                 "source": "clustered_foot",
             })
+
+        # The base has physically at most 2 blue feet.
+        # If > 2 feet are detected, filter out spurious slivers / stud noise and keep the 2 valid feet.
+        if len(feet) > 2 and gbox is not None:
+            feet.sort(key=lambda f: (1 if are_adjacent(f["bbox"], gbox, max_gap=45) else 0, f["area"]), reverse=True)
+            filtered_feet = []
+            for f in feet:
+                is_sub = False
+                for kf in filtered_feet:
+                    if are_adjacent(f["bbox"], kf["bbox"], max_gap=25) or compute_iou(f["bbox"], kf["bbox"]) > 0.10:
+                        is_sub = True
+                        break
+                if not is_sub:
+                    filtered_feet.append(f)
+                if len(filtered_feet) == 2:
+                    break
+            if len(filtered_feet) == 2:
+                return filtered_feet
+
         return feet
 
-    def cluster_same_color_blocks(self, dets, max_dim=210):
+
+    def cluster_same_color_blocks(self, dets, max_dim=150):
         """
         Groups bounding boxes of the same color that belong to the same physical block (e.g. stud + body).
-        Enforces physical unit dimension constraint (uw <= max_dim and uh <= max_dim).
+        Enforces physical unit dimension constraint and prevents merging two distinct full blocks.
         """
         if not dets or len(dets) <= 1:
             return dets
@@ -293,10 +419,12 @@ class ComponentDetector:
         for d in sorted_dets:
             b = d["bbox"]
             bx, by, bw, bh = b
+            area_b = b[2] * b[3]
             merged = False
             for c in clusters:
                 cb = c["bbox"]
                 cx, cy, cw, ch = cb
+                area_cb = cb[2] * cb[3]
                 x1 = min(bx, cx)
                 y1 = min(by, cy)
                 x2 = max(bx + bw, cx + cw)
@@ -308,8 +436,12 @@ class ComponentDetector:
                 if uw > max_dim or uh > max_dim:
                     continue
 
+                # NEVER merge two full-sized blocks! Only merge if one is a small stud sliver
+                if min(area_b, area_cb) >= 3500 and min(b[2], b[3]) >= 26 and min(cb[2], cb[3]) >= 26:
+                    continue
+
                 # Check proximity or overlap
-                if compute_iou(b, cb) > 0.05 or are_adjacent(b, cb, max_gap=25):
+                if compute_iou(b, cb) > 0.15 or are_adjacent(b, cb, max_gap=12):
                     c["bbox"] = (x1, y1, uw, uh)
                     c["center"] = (x1 + uw // 2, y1 + uh // 2)
                     c["area"] = uw * uh
@@ -322,7 +454,7 @@ class ComponentDetector:
 
         return clusters
 
-    def deduplicate_detections(self, detections):
+    def deduplicate_detections(self, detections, img=None, current_step_index=0):
         """
         Suppresses duplicate stud slivers, resolves split feet across the green beam,
         and ensures true physical block counts across all colors.
@@ -353,7 +485,7 @@ class ComponentDetector:
                         is_dup = True
                         break
                     # Stud sliver attached to top/bottom of block
-                    if d["area"] < 8000 and are_adjacent(boxA, boxB, max_gap=15):
+                    if d["area"] < 3500 and are_adjacent(boxA, boxB, max_gap=15):
                         is_dup = True
                         break
                 if not is_dup:
@@ -367,9 +499,35 @@ class ComponentDetector:
         yellows = [d for d in cleaned if d["class_name"] == "yellow_block"]
 
         gdet = greens[0] if greens else None
+
+        # 1. Blue feet: split wide/tall boxes covering both feet, then cluster stud halves
+        if blues and img is not None:
+            blues = self.split_merged_blue_feet(blues, img, gdet)
         resolved_blues = self.cluster_feet_along_beam(blues, gdet) if len(blues) > 1 else blues
-        resolved_reds = self.cluster_same_color_blocks(reds, max_dim=210) if len(reds) > 1 else reds
-        resolved_yellows = self.cluster_same_color_blocks(yellows, max_dim=210) if len(yellows) > 1 else yellows
+
+        # 2. Red blocks: at Step 3, ensure any secondary stud detection on the 1st red block is merged
+        if current_step_index == 3 and len(reds) > 1 and gdet is not None:
+            gbox = gdet["bbox"]
+            body_reds = [r for r in reds if are_adjacent(r["bbox"], gbox, max_gap=80)]
+            if len(body_reds) >= 2:
+                bx1 = min(r["bbox"][0] for r in body_reds)
+                by1 = min(r["bbox"][1] for r in body_reds)
+                bx2 = max(r["bbox"][0] + r["bbox"][2] for r in body_reds)
+                by2 = max(r["bbox"][1] + r["bbox"][3] for r in body_reds)
+                merged_r = {
+                    "class_name": "red_block",
+                    "class_id": 2,
+                    "bbox": (bx1, by1, bx2 - bx1, by2 - by1),
+                    "center": (bx1 + (bx2 - bx1) // 2, by1 + (by2 - by1) // 2),
+                    "area": (bx2 - bx1) * (by2 - by1),
+                    "confidence": max(r["confidence"] for r in body_reds),
+                    "source": "merged_step3",
+                }
+                other_reds = [r for r in reds if r not in body_reds]
+                reds = [merged_r] + other_reds
+
+        resolved_reds = self.cluster_same_color_blocks(reds, max_dim=150) if len(reds) > 1 else reds
+        resolved_yellows = self.cluster_same_color_blocks(yellows, max_dim=150) if len(yellows) > 1 else yellows
 
         return greens + resolved_blues + resolved_reds + resolved_yellows
 
@@ -404,7 +562,8 @@ class ComponentDetector:
 
         # 1. Detect all blocks in frame with YOLO/plastic detector
         raw_detections = self.block_detector.detect(img)
-        cleaned_detections = self.deduplicate_detections(raw_detections)
+        cleaned_detections = self.deduplicate_detections(raw_detections, img=img, current_step_index=current_step_index)
+
 
         # 2. Strict Empty Frame Check: if workspace has 0 blocks, it is strictly state_0_unstarted
         if not cleaned_detections:
