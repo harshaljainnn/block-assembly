@@ -44,6 +44,56 @@ class DashboardBridge:
         self.cycle_id = None
         self.enabled = bool(self.api_url)
 
+        self._latest_jpeg = None
+        self._frame_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        if self.enabled:
+            self._start_frame_streamer()
+
+    def update_frame(self, frame):
+        """
+        Compresses the annotated HUD frame to JPEG and hands it off to the background streamer.
+        """
+        if not self.enabled:
+            return
+        try:
+            h, w = frame.shape[:2]
+            if w > 960:
+                scale = 960.0 / w
+                frame = cv2.resize(frame, (960, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+            ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
+            if ret:
+                with self._frame_lock:
+                    self._latest_jpeg = buf.tobytes()
+        except Exception:
+            pass
+
+    def _start_frame_streamer(self):
+        def worker():
+            import requests
+            session = requests.Session()
+            headers = {"Content-Type": "image/jpeg"}
+            if self.api_key:
+                headers["x-cv-api-key"] = self.api_key
+            url = f"{self.api_url}/api/camera/frame"
+
+            while not self._stop_event.is_set():
+                jpeg_data = None
+                with self._frame_lock:
+                    jpeg_data = self._latest_jpeg
+                    self._latest_jpeg = None
+
+                if jpeg_data:
+                    try:
+                        session.post(url, data=jpeg_data, headers=headers, timeout=0.5)
+                    except Exception:
+                        pass
+                time.sleep(0.033)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
     def _async_post(self, endpoint, data):
         if not self.enabled:
             return
@@ -456,6 +506,10 @@ def run_video(video_source, detector, sm, dashboard=None):
 
         res = detector.analyze(frame, current_step_index=sm.current_index)
         annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps)
+
+        # Stream the live AI HUD frame (with bounding boxes, labels, and PiP) to dashboard
+        if dashboard and dashboard.enabled:
+            dashboard.update_frame(annotated)
 
         # Log state advancements, defects/errors, or periodic telemetry to Dashboard backend
         if dashboard and dashboard.enabled:

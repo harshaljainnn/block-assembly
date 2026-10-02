@@ -1,5 +1,6 @@
 import os
 import secrets
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -45,7 +46,7 @@ else:
 app = FastAPI(
     title="Assembly Performance API",
     description="Backend API and Dashboard for Live Block Assembly Inspection",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # Allow React / Hatchable dashboard to call the API.
@@ -59,7 +60,7 @@ app.add_middleware(
 
 
 # ============================================================
-# LOCAL IN-MEMORY STORAGE
+# LOCAL IN-MEMORY STORAGE & FRAME BUFFER
 # ============================================================
 
 LOCAL_OPERATORS = {
@@ -69,6 +70,9 @@ LOCAL_OPERATORS = {
 
 LOCAL_SESSIONS = {}  # cycle_id -> dict
 LOCAL_EVENTS = []    # list of event dicts
+
+LATEST_HUD_FRAME: Optional[bytes] = None
+LATEST_FRAME_TIME: float = 0.0
 
 
 # ============================================================
@@ -202,7 +206,7 @@ class EndAssemblyRequest(BaseModel):
 
 
 # ============================================================
-# HEALTH & CAMERA STREAM PROXY
+# HEALTH & CAMERA STREAM PROXIES
 # ============================================================
 
 @app.get("/health")
@@ -212,13 +216,53 @@ def health():
         "service": "assembly-performance-api",
         "mode": "local" if USE_LOCAL_MODE else "supabase",
         "supabase_configured": not USE_LOCAL_MODE,
+        "hud_stream_active": bool(LATEST_HUD_FRAME and (time.time() - LATEST_FRAME_TIME < 3.0)),
     }
+
+
+@app.post("/api/camera/frame")
+async def receive_frame(
+    request: Request,
+    x_cv_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Receives compressed JPEG HUD frames from live_demo.py with all YOLO
+    bounding boxes, labels, and PiP insets.
+    """
+    global LATEST_HUD_FRAME, LATEST_FRAME_TIME
+    verify_cv_api_key(x_cv_api_key)
+    LATEST_HUD_FRAME = await request.body()
+    LATEST_FRAME_TIME = time.time()
+    return {"status": "ok"}
+
+
+@app.get("/api/camera/hud_stream")
+def hud_stream():
+    """
+    Streams the live AI-annotated HUD frame (with bounding boxes, PiP, checklist)
+    to browser clients as a standard MJPEG stream.
+    """
+    def generate():
+        while True:
+            if LATEST_HUD_FRAME and (time.time() - LATEST_FRAME_TIME < 3.0):
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + LATEST_HUD_FRAME
+                    + b"\r\n"
+                )
+            time.sleep(0.033)  # ~30 FPS
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace;boundary=frame",
+    )
 
 
 @app.get("/api/camera/stream")
 def camera_stream():
     """
-    Proxies the DroidCam MJPEG stream directly to browser clients.
+    Proxies the DroidCam raw MJPEG stream directly to browser clients.
     """
     def generate():
         try:
@@ -697,6 +741,7 @@ def get_latest():
         today_fails = sum(1 for s in sessions_today if s.get("status") == "fail")
 
         active_cycle_number = latest_session.get("cycle_number") if latest_session else (len(sessions) if sessions else 1)
+        hud_active = bool(LATEST_HUD_FRAME and (time.time() - LATEST_FRAME_TIME < 3.0))
 
         return {
             "session": latest_session,
@@ -709,6 +754,7 @@ def get_latest():
             "pass_count": passes,
             "fail_count": fails,
             "pass_rate": pass_rate,
+            "hud_active": hud_active,
         }
     return {"status": "ok", "mode": "supabase"}
 
@@ -763,52 +809,72 @@ def dashboard_ui():
 
   <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
     
-    <!-- 1. LIVE CAMERA FEED SECTION -->
+    <!-- 1. LIVE AI COMPUTER VISION HUD STREAM SECTION -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
       <div class="px-6 py-4 border-b border-slate-800 bg-slate-900/90 flex flex-wrap items-center justify-between gap-4">
         <div class="flex items-center gap-3">
-          <div class="p-2.5 bg-rose-500/10 text-rose-400 rounded-xl border border-rose-500/20">
-            <i class="fa-solid fa-video text-base"></i>
+          <div class="p-2.5 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20">
+            <i class="fa-solid fa-brain text-base"></i>
           </div>
           <div>
             <h2 class="text-base font-bold text-white flex items-center gap-2">
-              Live Camera Stream
+              Live AI Inspection Stream
               <span id="cam-status-pill" class="text-[11px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5">
                 <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 pulse-live"></span>
-                <span id="cam-status-text">LIVE FEED</span>
+                <span id="cam-status-text">AI BOUNDING BOXES ACTIVE</span>
               </span>
             </h2>
-            <p class="text-xs text-slate-400">DroidCam Feed: <span id="cam-active-ip" class="font-mono text-slate-300">192.168.2.217:4747</span></p>
+            <p class="text-xs text-slate-400">Stream: <span id="cam-active-mode" class="font-mono text-emerald-300">YOLO Detection & Sequential HUD</span></p>
           </div>
         </div>
+
         <div class="flex items-center gap-3">
-          <div class="flex items-center bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300 gap-2">
+          <!-- Feed Switcher (HUD vs Raw Phone) -->
+          <div class="inline-flex rounded-xl bg-slate-950 p-1 border border-slate-800 text-xs">
+            <button id="btn-mode-hud" onclick="switchStreamMode('hud')" class="px-3 py-1.5 rounded-lg font-medium transition bg-emerald-600 text-white flex items-center gap-1.5">
+              <i class="fa-solid fa-cube text-xs"></i> AI HUD Feed (Boxes)
+            </button>
+            <button id="btn-mode-raw" onclick="switchStreamMode('raw')" class="px-3 py-1.5 rounded-lg font-medium transition text-slate-400 hover:text-white flex items-center gap-1.5">
+              <i class="fa-solid fa-mobile-screen text-xs"></i> Raw Phone
+            </button>
+          </div>
+
+          <div id="raw-url-box" class="hidden flex items-center bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300 gap-2">
             <i class="fa-solid fa-link text-slate-500"></i>
-            <input id="stream-url-input" type="text" value="http://192.168.2.217:4747/video" class="bg-transparent text-xs font-mono text-slate-200 outline-none w-56 placeholder-slate-600" placeholder="http://<ip>:4747/video" />
-            <button onclick="updateCameraStream()" class="hover:text-emerald-400 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition" title="Apply Stream URL">
+            <input id="stream-url-input" type="text" value="http://192.168.2.217:4747/video" class="bg-transparent text-xs font-mono text-slate-200 outline-none w-48 placeholder-slate-600" />
+            <button onclick="updateCameraStream()" class="hover:text-emerald-400 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition" title="Apply URL">
               <i class="fa-solid fa-arrow-rotate-right"></i>
             </button>
           </div>
-          <button onclick="toggleCamFullscreen()" class="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl transition text-xs" title="Expand View">
+
+          <button onclick="toggleCamFullscreen()" class="p-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl transition text-xs" title="Expand View">
             <i class="fa-solid fa-expand"></i>
           </button>
         </div>
       </div>
 
-      <div class="relative bg-slate-950 flex items-center justify-center min-h-[360px] max-h-[500px] overflow-hidden group" id="cam-wrapper">
-        <img id="camera-stream-img" src="http://192.168.2.217:4747/video" alt="DroidCam Feed" class="w-full h-auto max-h-[480px] object-contain transition-all" onload="onStreamLoaded()" onerror="onStreamError()" />
+      <div class="relative bg-slate-950 flex items-center justify-center min-h-[380px] max-h-[540px] overflow-hidden group" id="cam-wrapper">
+        <img id="camera-stream-img" src="/api/camera/hud_stream" alt="AI Inspection HUD Stream" class="w-full h-auto max-h-[520px] object-contain transition-all" onload="onStreamLoaded()" onerror="onStreamError()" />
         
         <!-- Stream Disconnected Overlay -->
         <div id="cam-fallback" class="hidden absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-6 text-center">
           <div class="p-6 bg-slate-900 border border-slate-800 rounded-2xl max-w-md shadow-2xl space-y-3">
             <div class="w-12 h-12 bg-amber-500/10 text-amber-400 rounded-2xl flex items-center justify-center mx-auto text-xl border border-amber-500/20">
-              <i class="fa-solid fa-triangle-exclamation"></i>
+              <i class="fa-solid fa-microchip"></i>
             </div>
-            <h3 class="text-sm font-bold text-white">DroidCam Stream Awaiting Connection</h3>
-            <p class="text-xs text-slate-400">Ensure the DroidCam app is open on your phone at <code id="fallback-ip-text" class="text-amber-300 font-mono">192.168.2.217:4747</code>, or update the URL above.</p>
-            <button onclick="updateCameraStream()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition flex items-center gap-2 mx-auto">
-              <i class="fa-solid fa-rotate"></i> Retry Connection
-            </button>
+            <h3 class="text-sm font-bold text-white">AI HUD Stream Waiting for Detector</h3>
+            <p class="text-xs text-slate-400">Launch the live detector in your terminal to start streaming the real-time AI feed with bounding boxes:</p>
+            <div class="bg-slate-950 border border-slate-800 p-2.5 rounded-xl font-mono text-[11px] text-emerald-400 select-all">
+              python live_demo.py --camera phone --dashboard http://localhost:8000
+            </div>
+            <div class="pt-2 flex items-center justify-center gap-3">
+              <button onclick="switchStreamMode('raw')" class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition">
+                View Raw Phone Feed
+              </button>
+              <button onclick="switchStreamMode('hud')" class="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition">
+                Retry AI Feed
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -956,46 +1022,63 @@ def dashboard_ui():
     ];
 
     // ========================================================
-    // CAMERA STREAM CONTROLS
+    // CAMERA STREAM CONTROLS (AI HUD vs RAW DROIDCAM)
     // ========================================================
+    let currentStreamMode = "hud"; // "hud" (AI with bounding boxes) or "raw"
     const savedStreamUrl = localStorage.getItem("droidcam_stream_url") || "http://192.168.2.217:4747/video";
     const streamInput = document.getElementById("stream-url-input");
     const streamImg = document.getElementById("camera-stream-img");
     const fallbackBox = document.getElementById("cam-fallback");
     const camStatusPill = document.getElementById("cam-status-pill");
     const camStatusText = document.getElementById("cam-status-text");
-    const camActiveIp = document.getElementById("cam-active-ip");
+    const camActiveMode = document.getElementById("cam-active-mode");
+    const rawBox = document.getElementById("raw-url-box");
 
     streamInput.value = savedStreamUrl;
+
+    function switchStreamMode(mode) {
+      currentStreamMode = mode;
+      const btnHud = document.getElementById("btn-mode-hud");
+      const btnRaw = document.getElementById("btn-mode-raw");
+
+      fallbackBox.classList.add("hidden");
+
+      if (mode === "hud") {
+        btnHud.className = "px-3 py-1.5 rounded-lg font-medium transition bg-emerald-600 text-white flex items-center gap-1.5";
+        btnRaw.className = "px-3 py-1.5 rounded-lg font-medium transition text-slate-400 hover:text-white flex items-center gap-1.5";
+        rawBox.classList.add("hidden");
+        camActiveMode.innerText = "YOLO Detection & Sequential HUD";
+        streamImg.src = "/api/camera/hud_stream?t=" + Date.now();
+        camStatusText.innerText = "AI BOUNDING BOXES ACTIVE";
+      } else {
+        btnRaw.className = "px-3 py-1.5 rounded-lg font-medium transition bg-indigo-600 text-white flex items-center gap-1.5";
+        btnHud.className = "px-3 py-1.5 rounded-lg font-medium transition text-slate-400 hover:text-white flex items-center gap-1.5";
+        rawBox.classList.remove("hidden");
+        camActiveMode.innerText = "Direct DroidCam Feed";
+        streamImg.src = streamInput.value;
+        camStatusText.innerText = "RAW PHONE FEED";
+      }
+    }
 
     function updateCameraStream() {
       const url = streamInput.value.trim();
       localStorage.setItem("droidcam_stream_url", url);
-      fallbackBox.classList.add("hidden");
-      streamImg.src = "";
-      setTimeout(() => {
-        streamImg.src = url;
-      }, 100);
-
-      try {
-        const parsed = new URL(url);
-        camActiveIp.innerText = parsed.host;
-      } catch (e) {
-        camActiveIp.innerText = url;
+      if (currentStreamMode === "raw") {
+        streamImg.src = "";
+        setTimeout(() => { streamImg.src = url; }, 100);
       }
     }
 
     function onStreamLoaded() {
       fallbackBox.classList.add("hidden");
       camStatusPill.className = "text-[11px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5";
-      camStatusText.innerText = "LIVE FEED";
+      camStatusText.innerText = currentStreamMode === "hud" ? "AI BOUNDING BOXES ACTIVE" : "RAW PHONE FEED";
     }
 
     function onStreamError() {
       fallbackBox.classList.remove("hidden");
-      document.getElementById("fallback-ip-text").innerText = streamInput.value;
       camStatusPill.className = "text-[11px] font-mono uppercase bg-rose-500/20 text-rose-400 border border-rose-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5";
-      camStatusText.innerText = "OFFLINE";
+      camStatusText.innerText = currentStreamMode === "hud" ? "AI FEED WAITING" : "OFFLINE";
     }
 
     function toggleCamFullscreen() {
@@ -1062,6 +1145,15 @@ def dashboard_ui():
 
           const sess = latestData.session;
           const evt = latestData.latest_event;
+
+          // AI HUD stream active auto-check
+          if (currentStreamMode === "hud") {
+            if (latestData.hud_active) {
+              fallbackBox.classList.add("hidden");
+              camStatusPill.className = "text-[11px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5";
+              camStatusText.innerText = "AI BOUNDING BOXES ACTIVE";
+            }
+          }
 
           // 1. Update Active Cycle Card
           if (sess) {
