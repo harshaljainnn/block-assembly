@@ -59,6 +59,10 @@ class ComponentDetector:
         """
         Ensures that when the assembly is at Step 5 or beyond (where 2 red blocks are stacked in the body),
         the body red block is properly recognized and split into TWO separate red blocks if YOLO detected them as 1.
+        Strictly respects physical orientation:
+          - Taller than wide (ch > cw) -> splits HORIZONTALLY along Y into TOP & BOTTOM (stacked).
+          - Wider than tall (cw > ch) -> splits VERTICALLY along X into LEFT & RIGHT (side-by-side).
+          - Single 2x2 blocks (aspect < 1.25 and area < 8500) are NEVER split.
         """
         is_step5_plus = (current_step_index >= 5) or (
             current_step_index >= 4 and cls_pred in [
@@ -99,101 +103,113 @@ class ComponentDetector:
         x2, y2 = min(w_img, bx + bw), min(h_img, by + bh)
         cw, ch = x2 - x1, y2 - y1
 
-        # Only split if block has proportions of 2 stacked blocks
+        if cw < 30 or ch < 30:
+            return detections
+
+        aspect = max(cw, ch) / max(min(cw, ch), 1)
         target_area = target_r.get("area", cw * ch)
-        is_tall = (ch >= 1.22 * cw) or (target_area >= 13500 and ch >= 0.95 * cw)
-        is_wide = (cw >= 1.22 * ch) or (target_area >= 13500 and cw >= 0.95 * ch)
 
-        if cw >= 30 and ch >= 30 and (is_tall or is_wide):
-            crop = img[y1:y2, x1:x2]
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # NEVER split a single 2x2 red block!
+        if aspect < 1.25 and target_area < 8500:
+            return detections
 
-            if gbox is not None:
-                split_horiz = is_tall or (gbox[2] > gbox[3] and not is_wide)
-            else:
-                split_horiz = is_tall
+        crop = img[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        sobely = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+        sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
 
-            if split_horiz and ch >= 45:
-                sobely = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
-                r1, r2 = int(0.35 * ch), int(0.65 * ch)
-                row_sums = np.sum(sobely, axis=1) if ch > 10 else [0]
-                best_r = r1 + int(np.argmax(row_sums[r1:r2])) if r2 > r1 else ch // 2
+        # Check orientation strictly based on cw and ch:
+        # NEVER use gbox to invert or override the red block's physical geometry!
+        if cw > ch:
+            # WIDER than tall: side-by-side blocks!
+            # Cut axis is strictly VERTICAL along X (producing Left and Right blocks)
+            if cw < 1.35 * ch and target_area < 11000:
+                return detections
 
-                h1 = best_r
-                h2 = bh - h1
-                if min(h1, h2) / max(h1, h2) < 0.45:
-                    h1 = ch // 2
-                    h2 = bh - h1
-
-                if h1 >= 25 and h2 >= 25:
-                    conf = target_r.get("confidence", 0.92)
-                    cls_id = target_r.get("class_id", 2)
-                    new_r1 = {
-                        "class_name": "red_block",
-                        "class_id": cls_id,
-                        "bbox": (bx, by, bw, h1),
-                        "center": (bx + bw // 2, by + h1 // 2),
-                        "area": bw * h1,
-                        "confidence": float(conf),
-                        "source": "stacked_corroborated",
-                    }
-                    new_r2 = {
-                        "class_name": "red_block",
-                        "class_id": cls_id,
-                        "bbox": (bx, by + h1, bw, h2),
-                        "center": (bx + bw // 2, by + h1 + h2 // 2),
-                        "area": bw * h2,
-                        "confidence": float(conf),
-                        "source": "stacked_corroborated",
-                    }
-                    res = [d for d in detections if d != target_r] + [new_r1, new_r2]
-                    res.sort(key=lambda d: d["area"], reverse=True)
-                    return res
-
-            elif not split_horiz and cw >= 45:
-                sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-                c1, c2 = int(0.35 * cw), int(0.65 * cw)
-                col_sums = np.sum(sobelx, axis=0) if cw > 10 else [0]
-                best_c = c1 + int(np.argmax(col_sums[c1:c2])) if c2 > c1 else cw // 2
-
-                w1 = best_c
+            c1, c2 = int(0.30 * cw), int(0.70 * cw)
+            col_sums = np.sum(sobelx, axis=0) if cw > 10 else [0]
+            best_c = c1 + int(np.argmax(col_sums[c1:c2])) if c2 > c1 else cw // 2
+            w1 = best_c
+            w2 = bw - w1
+            if min(w1, w2) / max(w1, w2) < 0.40:
+                w1 = cw // 2
                 w2 = bw - w1
-                if min(w1, w2) / max(w1, w2) < 0.45:
-                    w1 = cw // 2
-                    w2 = bw - w1
 
-                if w1 >= 25 and w2 >= 25:
-                    conf = target_r.get("confidence", 0.92)
-                    cls_id = target_r.get("class_id", 2)
-                    new_r1 = {
-                        "class_name": "red_block",
-                        "class_id": cls_id,
-                        "bbox": (bx, by, w1, bh),
-                        "center": (bx + w1 // 2, by + bh // 2),
-                        "area": w1 * bh,
-                        "confidence": float(conf),
-                        "source": "stacked_corroborated",
-                    }
-                    new_r2 = {
-                        "class_name": "red_block",
-                        "class_id": cls_id,
-                        "bbox": (bx + w1, by, w2, bh),
-                        "center": (bx + w1 + w2 // 2, by + bh // 2),
-                        "area": w2 * bh,
-                        "confidence": float(conf),
-                        "source": "stacked_corroborated",
-                    }
-                    res = [d for d in detections if d != target_r] + [new_r1, new_r2]
-                    res.sort(key=lambda d: d["area"], reverse=True)
-                    return res
+            if w1 >= 25 and w2 >= 25:
+                conf = target_r.get("confidence", 0.92)
+                cls_id = target_r.get("class_id", 2)
+                new_r1 = {
+                    "class_name": "red_block",
+                    "class_id": cls_id,
+                    "bbox": (bx, by, w1, bh),
+                    "center": (bx + w1 // 2, by + bh // 2),
+                    "area": w1 * bh,
+                    "confidence": float(conf),
+                    "source": "stacked_corroborated",
+                }
+                new_r2 = {
+                    "class_name": "red_block",
+                    "class_id": cls_id,
+                    "bbox": (bx + w1, by, w2, bh),
+                    "center": (bx + w1 + w2 // 2, by + bh // 2),
+                    "area": w2 * bh,
+                    "confidence": float(conf),
+                    "source": "stacked_corroborated",
+                }
+                res = [d for d in detections if d != target_r] + [new_r1, new_r2]
+                res.sort(key=lambda d: d["area"], reverse=True)
+                return res
+
+        elif ch > cw:
+            # TALLER than wide: stacked blocks!
+            # Cut axis is strictly HORIZONTAL along Y (producing Top and Bottom blocks)
+            if ch < 1.48 * cw and target_area < 11000:
+                return detections
+
+            r1, r2 = int(0.30 * ch), int(0.70 * ch)
+            row_sums = np.sum(sobely, axis=1) if ch > 10 else [0]
+            best_r = r1 + int(np.argmax(row_sums[r1:r2])) if r2 > r1 else ch // 2
+            h1 = best_r
+            h2 = bh - h1
+            if min(h1, h2) / max(h1, h2) < 0.45:
+                h1 = ch // 2
+                h2 = bh - h1
+
+            if h1 >= 25 and h2 >= 25:
+                conf = target_r.get("confidence", 0.92)
+                cls_id = target_r.get("class_id", 2)
+                new_r1 = {
+                    "class_name": "red_block",
+                    "class_id": cls_id,
+                    "bbox": (bx, by, bw, h1),
+                    "center": (bx + bw // 2, by + h1 // 2),
+                    "area": bw * h1,
+                    "confidence": float(conf),
+                    "source": "stacked_corroborated",
+                }
+                new_r2 = {
+                    "class_name": "red_block",
+                    "class_id": cls_id,
+                    "bbox": (bx, by + h1, bw, h2),
+                    "center": (bx + bw // 2, by + h1 + h2 // 2),
+                    "area": bw * h2,
+                    "confidence": float(conf),
+                    "source": "stacked_corroborated",
+                }
+                res = [d for d in detections if d != target_r] + [new_r1, new_r2]
+                res.sort(key=lambda d: d["area"], reverse=True)
+                return res
 
         return detections
 
 
     def split_merged_blue_feet(self, blue_dets, img, green_det=None):
         """
-        If a single blue detection encompasses both feet along the green beam,
+        If a single blue detection encompasses both feet along the green beam or two adjacent feet,
         splits it into two separate foot detections.
+        Strictly respects orientation:
+          - cw > ch: cuts vertically along X into Left Foot and Right Foot.
+          - ch > cw: cuts horizontally along Y into Top Foot and Bottom Foot.
         """
         if not blue_dets or img is None:
             return blue_dets
@@ -217,15 +233,29 @@ class ComponentDetector:
             x2, y2 = min(w_img, bx + bw), min(h_img, by + bh)
             cw, ch = x2 - x1, y2 - y1
 
+            if cw < 35 or ch < 35:
+                result.append(bdet)
+                continue
+
+            aspect = max(cw, ch) / max(min(cw, ch), 1)
+            area = cw * ch
+
+            # Single foot protection
+            if aspect < 1.25 and area < 8500:
+                result.append(bdet)
+                continue
+
             split_axis = None
-            if is_vertical_beam or (not is_horizontal_beam and ch >= 1.40 * cw and ch >= 160):
-                if ch >= 1.35 * cw and ch >= 150:
+            if ch > cw:
+                # TALLER than wide: stacked along Y
+                if ch >= 1.28 * cw or (is_vertical_beam and ch >= 50) or area >= 10500:
                     split_axis = "horizontal"
-            elif is_horizontal_beam or (cw >= 1.40 * ch and cw >= 160):
-                if cw >= 1.35 * ch and cw >= 150:
+            elif cw > ch:
+                # WIDER than tall: side-by-side along X
+                if cw >= 1.28 * ch or (is_horizontal_beam and cw >= 50) or area >= 10500:
                     split_axis = "vertical"
 
-            if split_axis is None or cw < 40 or ch < 40:
+            if split_axis is None:
                 result.append(bdet)
                 continue
 
@@ -242,7 +272,7 @@ class ComponentDetector:
                 if min(h1, h2) / max(h1, h2) < 0.40:
                     h1 = ch // 2
                     h2 = bh - h1
-                if h1 >= 30 and h2 >= 30:
+                if h1 >= 25 and h2 >= 25:
                     conf = bdet.get("confidence", 0.90)
                     result.append({
                         "class_name": "blue_block",
@@ -274,7 +304,7 @@ class ComponentDetector:
                 if min(w1, w2) / max(w1, w2) < 0.40:
                     w1 = cw // 2
                     w2 = bw - w1
-                if w1 >= 30 and w2 >= 30:
+                if w1 >= 25 and w2 >= 25:
                     conf = bdet.get("confidence", 0.90)
                     result.append({
                         "class_name": "blue_block",

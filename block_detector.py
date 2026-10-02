@@ -179,13 +179,17 @@ class BlockDetector:
         detections.sort(key=lambda d: d["area"], reverse=True)
         return self.split_merged_blocks(detections, img)
 
-    def split_merged_red_block(self, detection, img):
+    def split_merged_block(self, detection, img):
         """
-        Splits a merged red_block detection into two individual red_block detections
-        when it contains two physically stacked or adjacent red blocks.
-        Uses seam boundary analysis and aspect ratio / area geometry.
+        Splits a merged block detection (red_block or blue_block) into two individual detections
+        when it physically encompasses two adjacent or stacked blocks.
+        Strictly respects orientation:
+          - cw > ch: cuts vertically along X into Left and Right blocks (never top & bottom).
+          - ch > cw: cuts horizontally along Y into Top and Bottom blocks (never left & right).
+          - Single blocks (aspect < 1.25 and area < 8500) are never split.
         """
-        if detection.get("class_name") != "red_block" or img is None:
+        cname = detection.get("class_name")
+        if cname not in ("red_block", "blue_block") or img is None:
             return [detection]
 
         # Suppress hand noise
@@ -198,7 +202,14 @@ class BlockDetector:
         x1, y1 = max(0, bx), max(0, by)
         x2, y2 = min(w_img, bx + bw), min(h_img, by + bh)
         cw, ch = x2 - x1, y2 - y1
-        if cw < 35 or ch < 35:
+        if cw < 30 or ch < 30:
+            return [detection]
+
+        area = cw * ch
+        aspect = max(cw, ch) / max(min(cw, ch), 1)
+
+        # Single 2x2 blocks are roughly square - never split single blocks!
+        if aspect < 1.25 and area < 8500:
             return [detection]
 
         crop = img[y1:y2, x1:x2]
@@ -207,86 +218,69 @@ class BlockDetector:
         sobely = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
         sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
 
-        # Horizontal seam in middle 35% to 65% of height
-        r1, r2 = int(0.35 * ch), int(0.65 * ch)
+        # Horizontal seam in middle 30% to 70% of height
+        r1, r2 = int(0.30 * ch), int(0.70 * ch)
         row_sums = np.sum(sobely, axis=1) if ch > 10 else np.array([0.0])
         best_r = r1 + int(np.argmax(row_sums[r1:r2])) if r2 > r1 else ch // 2
         r_peak = float(row_sums[best_r]) if r2 > r1 else 0.0
-        r_local = float(np.mean(row_sums[max(0, best_r - 8):min(ch, best_r + 9)])) if ch > 0 else 1.0
+        r_local = float(np.mean(row_sums[max(0, best_r - 6):min(ch, best_r + 7)])) if ch > 0 else 1.0
         r_contrast = r_peak / max(r_local, 1e-3)
         r_global = float(np.mean(row_sums)) if len(row_sums) > 0 else 1.0
         r_ratio = r_peak / max(r_global, 1e-3)
 
-        # Vertical seam in middle 35% to 65% of width
-        c1, c2 = int(0.35 * cw), int(0.65 * cw)
+        # Vertical seam in middle 30% to 70% of width
+        c1, c2 = int(0.30 * cw), int(0.70 * cw)
         col_sums = np.sum(sobelx, axis=0) if cw > 10 else np.array([0.0])
         best_c = c1 + int(np.argmax(col_sums[c1:c2])) if c2 > c1 else cw // 2
         c_peak = float(col_sums[best_c]) if c2 > c1 else 0.0
-        c_local = float(np.mean(col_sums[max(0, best_c - 8):min(cw, best_c + 9)])) if cw > 0 else 1.0
+        c_local = float(np.mean(col_sums[max(0, best_c - 6):min(cw, best_c + 7)])) if cw > 0 else 1.0
         c_contrast = c_peak / max(c_local, 1e-3)
         c_global = float(np.mean(col_sums)) if len(col_sums) > 0 else 1.0
         c_ratio = c_peak / max(c_global, 1e-3)
 
-        area = cw * ch
-        aspect = max(cw, ch) / max(min(cw, ch), 1)
-
         split_axis = None
         split_pos = None
 
-        # Check conditions for double red block:
-        # Require strong edge contrast and aspect ratio indicative of two stacked blocks (aspect >= 1.70)
-        # Never split a single 2x2 block (aspect ~1.0 - 1.35)
-        if ch >= 1.70 * cw and r_contrast >= 2.0 and r_ratio >= 1.90:
-            split_axis = "horizontal"
-            split_pos = best_r
+        if cw > ch:
+            # STRICT: Horizontal arrangement (side-by-side) can ONLY be cut vertically along X
+            if (cw >= 1.40 * ch and (c_contrast >= 1.45 or c_ratio >= 1.40)) or cw >= 1.65 * ch:
+                w1 = best_c
+                w2 = cw - w1
+                if min(w1, w2) / max(w1, w2) >= 0.40 and w1 >= 25 and w2 >= 25:
+                    split_axis = "vertical"
+                    split_pos = best_c
+        elif ch > cw:
+            # STRICT: Vertical arrangement (stacked) can ONLY be cut horizontally along Y
+            if ch >= 1.60 * cw or (ch >= 1.48 * cw and r_contrast >= 1.65 and r_ratio >= 2.10):
+                h1 = best_r
+                h2 = ch - h1
+                if min(h1, h2) / max(h1, h2) >= 0.50 and h1 >= 25 and h2 >= 25:
+                    split_axis = "horizontal"
+                    split_pos = best_r
+        else:
+            if c_peak >= r_peak and c_contrast >= 1.70:
+                split_axis = "vertical"
+                split_pos = best_c
+            elif r_peak > c_peak and r_contrast >= 1.70:
+                split_axis = "horizontal"
+                split_pos = best_r
 
-        elif cw >= 1.70 * ch and c_contrast >= 2.0 and c_ratio >= 1.90:
-            split_axis = "vertical"
-            split_pos = best_c
+        conf = detection.get("confidence", 0.88)
+        src = str(detection.get("source", "det")) + "_split"
+        cls_id = detection["class_id"]
 
-
-        # Execute horizontal split
-        if split_axis == "horizontal" and split_pos is not None:
-            y_cut = y1 + split_pos
-            h1 = y_cut - by
-            h2 = (by + bh) - y_cut
-            if h1 >= 25 and h2 >= 25 and min(h1, h2) / max(h1, h2) >= 0.50:
-                conf = detection.get("confidence", 0.88)
-                src = str(detection.get("source", "det")) + "_split"
-                cls_id = detection["class_id"]
-                return [
-                    {
-                        "class_name": "red_block",
-                        "class_id": cls_id,
-                        "bbox": (bx, by, bw, h1),
-                        "center": (bx + bw // 2, by + h1 // 2),
-                        "area": bw * h1,
-                        "confidence": float(conf),
-                        "source": src,
-                    },
-                    {
-                        "class_name": "red_block",
-                        "class_id": cls_id,
-                        "bbox": (bx, y_cut, bw, h2),
-                        "center": (bx + bw // 2, y_cut + h2 // 2),
-                        "area": bw * h2,
-                        "confidence": float(conf),
-                        "source": src,
-                    },
-                ]
-
-        # Execute vertical split
-        elif split_axis == "vertical" and split_pos is not None:
+        # Execute vertical split (produces Left & Right blocks)
+        if split_axis == "vertical" and split_pos is not None:
             x_cut = x1 + split_pos
             w1 = x_cut - bx
             w2 = (bx + bw) - x_cut
-            if w1 >= 25 and w2 >= 25 and min(w1, w2) / max(w1, w2) >= 0.50:
-                conf = detection.get("confidence", 0.88)
-                src = str(detection.get("source", "det")) + "_split"
-                cls_id = detection["class_id"]
+            if min(w1, w2) / max(w1, w2) < 0.40:
+                w1 = cw // 2
+                w2 = bw - w1
+            if w1 >= 25 and w2 >= 25:
                 return [
                     {
-                        "class_name": "red_block",
+                        "class_name": cname,
                         "class_id": cls_id,
                         "bbox": (bx, by, w1, bh),
                         "center": (bx + w1 // 2, by + bh // 2),
@@ -295,11 +289,41 @@ class BlockDetector:
                         "source": src,
                     },
                     {
-                        "class_name": "red_block",
+                        "class_name": cname,
                         "class_id": cls_id,
-                        "bbox": (x_cut, by, w2, bh),
-                        "center": (x_cut + w2 // 2, by + bh // 2),
+                        "bbox": (bx + w1, by, w2, bh),
+                        "center": (bx + w1 + w2 // 2, by + bh // 2),
                         "area": w2 * bh,
+                        "confidence": float(conf),
+                        "source": src,
+                    },
+                ]
+
+        # Execute horizontal split (produces Top & Bottom blocks)
+        elif split_axis == "horizontal" and split_pos is not None:
+            y_cut = y1 + split_pos
+            h1 = y_cut - by
+            h2 = (by + bh) - y_cut
+            if min(h1, h2) / max(h1, h2) < 0.40:
+                h1 = ch // 2
+                h2 = bh - h1
+            if h1 >= 25 and h2 >= 25:
+                return [
+                    {
+                        "class_name": cname,
+                        "class_id": cls_id,
+                        "bbox": (bx, by, bw, h1),
+                        "center": (bx + bw // 2, by + h1 // 2),
+                        "area": bw * h1,
+                        "confidence": float(conf),
+                        "source": src,
+                    },
+                    {
+                        "class_name": cname,
+                        "class_id": cls_id,
+                        "bbox": (bx, by + h1, bw, h2),
+                        "center": (bx + bw // 2, by + h1 + h2 // 2),
+                        "area": bw * h2,
                         "confidence": float(conf),
                         "source": src,
                     },
@@ -307,17 +331,21 @@ class BlockDetector:
 
         return [detection]
 
+    def split_merged_red_block(self, detection, img):
+        """Backward compatible helper forwarding to split_merged_block."""
+        return self.split_merged_block(detection, img)
+
     def split_merged_blocks(self, detections, img):
         """
-        Inspects all detections and splits any merged blocks (specifically stacked/adjacent red blocks).
+        Inspects all detections and splits any merged blocks (both red and blue blocks).
         """
         if not detections or img is None:
             return detections
 
         refined = []
         for d in detections:
-            if d.get("class_name") == "red_block":
-                refined.extend(self.split_merged_red_block(d, img))
+            if d.get("class_name") in ("red_block", "blue_block"):
+                refined.extend(self.split_merged_block(d, img))
             else:
                 refined.append(d)
 
