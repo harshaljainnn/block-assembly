@@ -17,7 +17,12 @@ __pycache__/
 
 # Temporary outputs and intermediate extraction dump
 demo_output.jpg
+demo_crop_step2.jpg
+live_current.jpg
+live_raw.jpg
 extracted_frames/
+errors/
+scratch/
 
 # IDE & Editor configs
 .idea/

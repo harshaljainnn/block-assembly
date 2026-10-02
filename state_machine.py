@@ -26,6 +26,11 @@ class AssemblyStateMachine:
         self.error_active = False
         self.error_detail = ""
         self.skipped_step_index = None
+        self.skip_streak = 0
+        self.empty_workspace_frames = 0
+        self.completion_frames = 0
+        self.empty_after_complete_frames = 0
+        self.reset_flash = 0
 
     def reset(self):
         """Resets assembly tracker back to Step 0."""
@@ -34,6 +39,11 @@ class AssemblyStateMachine:
         self.error_active = False
         self.error_detail = ""
         self.skipped_step_index = None
+        self.skip_streak = 0
+        self.empty_workspace_frames = 0
+        self.completion_frames = 0
+        self.empty_after_complete_frames = 0
+        self.reset_flash = 30
 
     def get_consensus(self):
         """Returns the most frequent valid state in the rolling window and its vote count."""
@@ -54,16 +64,47 @@ class AssemblyStateMachine:
         """
         Pushes a new frame prediction into the rolling buffer, performs majority voting,
         and triggers state advance or error latching once consensus is reached.
+        Includes cycle auto-reset upon completion.
         """
         self.history.append(raw_state)
         consensus_state, votes = self.get_consensus()
         ratio = f"{votes}/{len(self.history)}"
 
-        # If spatial constraints are violated, latch error immediately
+        # Workspace clear tracking (auto-reset when table is cleared)
+        if raw_state == "state_0_unstarted":
+            self.empty_workspace_frames += 1
+        else:
+            self.empty_workspace_frames = 0
+
+        # Auto-reset check when assembly cycle is completed
+        if self.is_complete():
+            self.completion_frames += 1
+            if self.empty_workspace_frames >= 20 or self.completion_frames >= 120:
+                self.reset()
+                return "reset", "Cycle Complete - Ready for Next Unit", "state_0_unstarted", "1/1"
+
+        # Mid-assembly or Error Reset:
+        # If user clears desk for ~0.8s (25 frames) or during error for ~0.5s (15 frames), AUTO-RESET to Step 0
+        if self.empty_workspace_frames >= (15 if self.error_active else 25):
+            if self.current_index > 0 or self.error_active:
+                self.reset()
+                return "reset", "Workspace Cleared - Reset to Step 0", "state_0_unstarted", "1/1"
+
+        # If assembling (parts are present on table but not yet attached), provide helpful prompt without sequence error
+        if diagnostic and diagnostic.startswith("ASSEMBLING:"):
+            self.error_active = False
+            self.error_detail = ""
+            return "assembling", diagnostic, consensus_state, ratio
+
+        # If spatial constraints are violated or wrong parts introduced, latch error
         if not is_valid_spatial and diagnostic and not diagnostic.startswith("PASS"):
             self.error_active = True
             self.error_detail = diagnostic
             return "error", self.error_detail, consensus_state, ratio
+
+        # If assembly is in progress and workspace is temporarily clear (e.g. assembly in hand), hold without resetting
+        if consensus_state == "state_0_unstarted" and self.current_index > 0:
+            return "holding", "Assembly in hand / Workspace clear", self.current_state(), ratio
 
         if consensus_state is None or votes < self.min_consensus:
             if self.error_active:
@@ -76,10 +117,21 @@ class AssemblyStateMachine:
     def current_state(self):
         return self.state_order[self.current_index]
 
-    def update(self, matched_state):
+    def update(self, matched_state, is_valid_spatial=True, diagnostic=""):
         """
-        Processes a consensus state prediction and enforces strict sequential assembly.
+        Processes a state prediction and enforces strict sequential assembly.
+        Includes self-healing when frame returns to the valid current step.
         """
+        if diagnostic and diagnostic.startswith("ASSEMBLING:"):
+            self.error_active = False
+            self.error_detail = ""
+            return "assembling", diagnostic
+
+        if not is_valid_spatial and diagnostic and not diagnostic.startswith("PASS"):
+            self.error_active = True
+            self.error_detail = diagnostic
+            return "error", self.error_detail
+
         if matched_state is None:
             if self.error_active:
                 return "error", self.error_detail
@@ -92,10 +144,16 @@ class AssemblyStateMachine:
 
         matched_index = self.state_order.index(matched_state)
 
-        # Case 1: Same as current step
+        # Case 0: Empty workspace while assembly is already in progress (assembly in hand)
+        if matched_index == 0 and self.current_index > 0:
+            return "holding", "Assembly in hand / Workspace clear"
+
+        # Case 1: Same as current step - Self-healing clears transient errors
         if matched_index == self.current_index:
-            if self.error_active:
-                return "error", self.error_detail
+            self.error_active = False
+            self.error_detail = ""
+            self.skipped_step_index = None
+            self.skip_streak = 0
             return "holding", None
 
         # Case 2: Valid sequential advance to the EXACT next step
@@ -104,39 +162,64 @@ class AssemblyStateMachine:
             self.error_active = False
             self.error_detail = ""
             self.skipped_step_index = None
+            self.skip_streak = 0
             return "advanced", self.current_state()
 
-        # Case 3: Reverted to an earlier step
+        # Case 2b: From Step 0, user directly places completed 2-legged base (Green + 2 Blue feet)
+        elif self.current_index == 0 and matched_index == 2:
+            self.current_index = 2
+            self.error_active = False
+            self.error_detail = ""
+            self.skipped_step_index = None
+            self.skip_streak = 0
+            return "advanced", self.current_state()
+
+        # Case 3: Reverted or temporary hand occlusion - hold current step without resetting progress
         elif matched_index < self.current_index:
-            self.error_active = True
-            self.error_detail = (
-                f"REVERTED to [{self.get_step_title(matched_index)}] "
-                f"(was on [{self.get_step_title(self.current_index)}])"
-            )
-            return "error", self.error_detail
+            self.skip_streak = 0
+            return "holding", f"Verifying [{self.get_step_title(self.current_index)}]"
 
         # Case 4: Skipped ahead out of order!
         else:
-            self.error_active = True
-            self.skipped_step_index = self.current_index + 1
+            self.skip_streak += 1
             expected = self.get_step_title(self.current_index + 1)
             detected = self.get_step_title(matched_index)
-            self.error_detail = f"SKIPPED STEP! Missing [{expected}], but found [{detected}]"
-            return "error", self.error_detail
+
+            # Require at least 2 consecutive consensus cycles to latch sequence error,
+            # preventing accidental trigger during in-flight hand placement
+            if self.skip_streak >= 2:
+                self.error_active = True
+                self.skipped_step_index = self.current_index + 1
+                self.error_detail = f"SKIPPED STEP! Missing [{expected}], but found [{detected}]"
+                return "error", self.error_detail
+            else:
+                return "holding", f"Verifying [{expected}]..."
 
     def get_steps_for_hud(self):
         """
         Returns the 9-step sequential inspection checklist for HUD rendering.
+        - Steps < current_index are 'verified' ([PASS] in Green)
+        - Step == current_index:
+          - If error: 'error_current' ([ERR ] in Red)
+          - If current_index > 0 or complete: 'current_passed' ([PASS] in Bright Green)
+          - If current_index == 0: 'current' ([NOW ] in Amber)
+        - Step == current_index + 1: 'next' ([NEXT] in Cyan)
+        - Steps > current_index + 1: 'pending' ([    ] in Dim Gray)
         """
         steps = []
         for i, sname in enumerate(self.state_order):
             title = STEP_TITLES.get(sname, sname)
             if i < self.current_index:
                 st = "verified"
-            elif self.error_active and i == self.skipped_step_index:
-                st = "skipped"
             elif i == self.current_index:
-                st = "error_current" if self.error_active else "current"
+                if self.error_active:
+                    st = "error_current"
+                elif self.current_index > 0 or self.is_complete():
+                    st = "current_passed"
+                else:
+                    st = "current"
+            elif i == self.current_index + 1:
+                st = "next" if not self.error_active else "pending"
             else:
                 st = "pending"
             steps.append({"title": title, "state": sname, "status": st, "index": i})

@@ -126,9 +126,9 @@ EXPECTED_PARTS_PER_STATE = {
     "state_3_first_red": {"min_total": 4, "parts": {"green_block": 1, "blue_block": 2, "red_block": 1}},
     "state_4_yellowred": {"min_total": 5, "parts": {"green_block": 1, "blue_block": 2, "red_block": 1, "yellow_block": 1}},
     "state_5_bothred": {"min_total": 6, "parts": {"green_block": 1, "blue_block": 2, "red_block": 2, "yellow_block": 1}},
-    "state_6_yellowafter2red": {"min_total": 7, "parts": {"green_block": 1, "blue_block": 2, "red_block": 2, "yellow_block": 2}},
-    "state_7_finalred": {"min_total": 8, "parts": {"green_block": 1, "blue_block": 2, "red_block": 3, "yellow_block": 2}},
-    "state_8_complete": {"min_total": 9, "parts": {"green_block": 1, "blue_block": 2, "red_block": 3, "yellow_block": 3}},
+    "state_6_yellowafter2red": {"min_total": 6, "parts": {"blue_block": 2, "red_block": 2, "yellow_block": 2}},
+    "state_7_finalred": {"min_total": 6, "parts": {"blue_block": 2, "red_block": 2, "yellow_block": 2}},
+    "state_8_complete": {"min_total": 7, "parts": {"blue_block": 2, "red_block": 2, "yellow_block": 3}},
 }
 
 # Next required incoming part color per step

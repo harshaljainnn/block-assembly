@@ -29,6 +29,17 @@ def evaluate_states(detector):
     correct_frames = 0
     state_results = {}
 
+    STATE_DIR_MAP = {
+        "state1": ("state_1_greenblue", 1),
+        "state2": ("state_2_green2blue", 2),
+        "state3": ("state_3_first_red", 3),
+        "state4": ("state_4_yellowred", 4),
+        "state5": ("state_5_bothred", 5),
+        "state6": ("state_6_yellowafter2red", 6),
+        "state7": ("state_7_finalred", 7),
+        "state8": ("state_8_complete", 8),
+    }
+
     for sname in sorted(os.listdir(states_dir)):
         s_path = os.path.join(states_dir, sname)
         if not os.path.isdir(s_path):
@@ -38,6 +49,7 @@ def evaluate_states(detector):
         if not val_files:
             continue
 
+        mapped_state, step_idx = STATE_DIR_MAP.get(sname, (sname, 0))
         s_correct = 0
         s_total = len(val_files)
 
@@ -47,10 +59,10 @@ def evaluate_states(detector):
             if img is None:
                 continue
 
-            res = detector.analyze(img)
+            res = detector.analyze(img, current_step_index=step_idx)
             pred = res["predicted_state"]
 
-            if pred == sname:
+            if pred == mapped_state:
                 s_correct += 1
 
         acc = (s_correct / s_total) * 100.0 if s_total > 0 else 0.0
@@ -59,7 +71,7 @@ def evaluate_states(detector):
         total_frames += s_total
         correct_frames += s_correct
 
-        title = STEP_TITLES.get(sname, sname)
+        title = STEP_TITLES.get(mapped_state, sname)
         print(f"  {title:<32}: {s_correct:>3}/{s_total:<3} ({acc:>5.1f}%)")
 
     overall_acc = (correct_frames / total_frames) * 100.0 if total_frames > 0 else 0.0

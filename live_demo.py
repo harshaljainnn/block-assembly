@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import time
 import argparse
 import cv2
 import numpy as np
@@ -47,7 +48,7 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         )
         display_state = consensus_state if consensus_state else state
     else:
-        status, detail = state_machine.update(state)
+        status, detail = state_machine.update(state, is_valid_spatial=is_valid, diagnostic=diagnostic)
         votes_ratio = "1/1"
         display_state = state
 
@@ -96,6 +97,10 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         header_color = (20, 120, 20)   # Forest Green
         border_color = (0, 220, 0)
         cv2.rectangle(frame, (0, 0), (w, h), border_color, 4)
+    elif status == "assembling":
+        header_color = (15, 75, 120)   # Warm Amber / Dark Teal Accent
+    elif status in ["advanced", "holding"] and state_machine.current_index > 0:
+        header_color = (15, 85, 30)    # Emerald Green for Verified State
     elif status == "advanced":
         header_color = (15, 60, 95)    # Dark Navy / Blue-Amber Accent
     else:
@@ -132,15 +137,33 @@ def draw_hud(frame, result, state_machine, smoothed=True):
         cv2.putText(frame, "100% COMPLETE & VERIFIED!", (12, 32), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
         cv2.putText(frame, "All 9 assembly stages verified in order.", (12, 68), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 255, 220), 1)
         cv2.putText(frame, "Figure structure complete!", (12, 102), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 255, 220), 1)
-        cv2.putText(frame, "READY FOR NEXT UNIT - Press 'r' to reset", (12, 138), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 255, 255), 1)
+        cv2.putText(frame, "AUTO-RESETTING FOR NEXT UNIT...", (12, 138), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (100, 255, 100), 1)
+    elif status == "assembling":
+        cur_title = state_machine.get_step_title(state_machine.current_index)
+        cv2.putText(frame, f"INSPECTION: {cur_title.upper()}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
+        prompt_txt = detail or diagnostic or "Parts present on table. Please assemble."
+        if prompt_txt.startswith("ASSEMBLING: "):
+            prompt_txt = prompt_txt[12:]
+        cv2.putText(frame, f"ACTION: {prompt_txt[:44]}", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (0, 220, 255), 1)
+        cv2.putText(frame, f"STATUS: ASSEMBLING (Parts Detected)", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (50, 200, 255), 1)
+        next_step = state_machine.get_step_title(state_machine.current_index + 1)
+        cv2.putText(frame, f"Target: [{next_step}]", (12, 118), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (180, 180, 180), 1)
+        if incoming:
+            inc_col = (0, 255, 0) if incoming["is_expected"] else (50, 50, 255)
+            cv2.putText(frame, incoming["message"][:48], (12, 145), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, inc_col, 1)
     else:
         cur_title = state_machine.get_step_title(state_machine.current_index)
         cv2.putText(frame, f"INSPECTION: {cur_title.upper()}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
-        cv2.putText(frame, f"LIVE: {display_state} ({conf*100:.0f}%)", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 220, 220), 1)
-        stat_color = (0, 220, 255) if status == "advanced" else (220, 180, 50)
-        cv2.putText(frame, f"STATUS: {status.upper()} (Dwell: {votes_ratio})", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, stat_color, 1)
-        next_step = state_machine.get_step_title(state_machine.current_index + 1)
-        cv2.putText(frame, f"Next: [{next_step}]", (12, 118), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (180, 180, 180), 1)
+        if state_machine.current_index > 0:
+            cv2.putText(frame, f"VERIFIED: {cur_title} PASSED", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (100, 255, 100), 1)
+            next_step = state_machine.get_step_title(state_machine.current_index + 1)
+            cv2.putText(frame, f"STATUS: PASSED (Waiting for next part)", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (80, 240, 120), 1)
+            cv2.putText(frame, f"Next Step: [{next_step}]", (12, 118), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (200, 220, 255), 1)
+        else:
+            cv2.putText(frame, f"LIVE: {display_state} ({conf*100:.0f}%)", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 220, 220), 1)
+            cv2.putText(frame, f"STATUS: {status.upper()} (Dwell: {votes_ratio})", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (220, 180, 50), 1)
+            next_step = state_machine.get_step_title(state_machine.current_index + 1)
+            cv2.putText(frame, f"Next Step: [{next_step}]", (12, 118), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (180, 180, 180), 1)
         if incoming:
             inc_col = (0, 255, 0) if incoming["is_expected"] else (50, 50, 255)
             cv2.putText(frame, incoming["message"][:48], (12, 145), cv2.FONT_HERSHEY_SIMPLEX, sub_scale, inc_col, 1)
@@ -148,22 +171,69 @@ def draw_hud(frame, result, state_machine, smoothed=True):
     steps = state_machine.get_steps_for_hud()
     for i, s in enumerate(steps):
         st = s["status"]
-        if st == "verified":
+        if st in ["verified", "current_passed"]:
             tag = "[PASS] "
-            col = (60, 235, 60)   # Green
-        elif st == "skipped":
-            tag = "[MISS] "
+            col = (60, 235, 60)   # Bright Green
+        elif st == "next":
+            tag = "[NEXT] "
+            col = (240, 210, 40)  # Cyan/Gold for next target step
+        elif st == "error_current":
+            tag = "[ERR ] "
             col = (40, 40, 255)   # Red
-        elif st in ["current", "error_current"]:
+        elif st == "current":
             tag = "[NOW ] "
-            col = (50, 180, 255) if st == "error_current" else (240, 210, 40)
+            col = (200, 200, 200) # Neutral
         else:
             tag = "[    ] "
-            col = (140, 140, 140) # Dim Gray
+            col = (110, 110, 110) # Dim Gray
 
         title = s["title"].split(". ", 1)[-1]
         text = f"{tag}{i}.{title[:14]}"
         cv2.putText(frame, text, (start_x, 18 + i * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1)
+
+    # 4. Flash banner if reset just occurred
+    if getattr(state_machine, "reset_flash", 0) > 0:
+        state_machine.reset_flash -= 1
+        b_h = 50
+        by1 = int(h * 0.42)
+        by2 = by1 + b_h
+        cv2.rectangle(frame, (0, by1), (w, by2), (0, 180, 0), -1)
+        cv2.rectangle(frame, (0, by1), (w, by2), (255, 255, 255), 2)
+        msg = "SYSTEM RESET TO STEP 0"
+        (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+        tx = max(10, int((w - tw) / 2))
+        cv2.putText(frame, msg, (tx, by1 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+
+    # 5. Bottom control bar & clickable buttons
+    bar_h = 32
+
+    # 4b. Picture-in-Picture (PiP) inset for the Cropped Assembly ROI
+    crop_img = result.get("crop")
+    if crop_img is not None and crop_img.size > 0:
+        pip_size = 110
+        pip_crop = cv2.resize(crop_img, (pip_size, pip_size))
+        pip_x1 = 12
+        pip_y1 = h - bar_h - pip_size - 8
+        pip_x2 = pip_x1 + pip_size
+        pip_y2 = pip_y1 + pip_size
+        if pip_y1 > header_h:
+            frame[pip_y1:pip_y2, pip_x1:pip_x2] = pip_crop
+            cv2.rectangle(frame, (pip_x1, pip_y1), (pip_x2, pip_y2), (0, 220, 255), 1)
+            cv2.putText(frame, "CROP ROI", (pip_x1 + 4, pip_y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1)
+
+    cv2.rectangle(frame, (0, h - bar_h), (w, h), (20, 20, 20), -1)
+    cv2.putText(frame, "[R/Space] Reset  |  [S] Snapshot  |  [Q] Quit", (12, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
+
+    # Clickable Buttons:
+    btn_r_x1 = max(w - 230, int(w * 0.65))
+    btn_r_x2 = btn_r_x1 + 105
+    cv2.rectangle(frame, (btn_r_x1, h - bar_h + 3), (btn_r_x2, h - 3), (40, 50, 180), -1)
+    cv2.putText(frame, "RESET (R)", (btn_r_x1 + 14, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+
+    btn_s_x1 = btn_r_x2 + 8
+    btn_s_x2 = btn_s_x1 + 105
+    cv2.rectangle(frame, (btn_s_x1, h - bar_h + 3), (btn_s_x2, h - 3), (120, 80, 20), -1)
+    cv2.putText(frame, "SNAP (S)", (btn_s_x1 + 16, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
 
     return frame
 
@@ -200,24 +270,63 @@ def run_video(video_source, detector, sm):
         return
 
     print(f"\nLive Inspection started on [{video_source}].")
-    print("Controls: 'q' = Quit, 'r' = Reset sequence.")
+    print("Controls: 'r'/Space = Reset, 's' = Snapshot, 'q'/Esc = Quit. (Or click on-screen buttons)")
+
+    window_name = "Block Assembly Checker (Live HUD)"
+    button_events = {"reset": False, "snap": False}
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            frame_h = param.get("h", 480)
+            frame_w = param.get("w", 640)
+            bar_top = frame_h - 32
+            if y >= bar_top:
+                btn_r_x1 = max(frame_w - 230, int(frame_w * 0.65))
+                btn_r_x2 = btn_r_x1 + 105
+                btn_s_x1 = btn_r_x2 + 8
+                btn_s_x2 = btn_s_x1 + 105
+                if btn_r_x1 <= x <= btn_r_x2:
+                    button_events["reset"] = True
+                elif btn_s_x1 <= x <= btn_s_x2:
+                    button_events["snap"] = True
+
+    cv2.namedWindow(window_name)
+    mouse_param = {"w": 640, "h": 480}
+    cv2.setMouseCallback(window_name, on_mouse, mouse_param)
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        res = detector.analyze(frame, current_step_index=sm.current_index)
-        annotated = draw_hud(frame, res, sm, smoothed=True)
+        mouse_param["w"] = frame.shape[1]
+        mouse_param["h"] = frame.shape[0]
 
-        cv2.imshow("Block Assembly Checker (Live HUD)", annotated)
+        res = detector.analyze(frame, current_step_index=sm.current_index)
+        annotated = draw_hud(frame.copy(), res, sm, smoothed=True)
+
+        cv2.imshow(window_name, annotated)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        do_reset = key in (ord("r"), ord("R"), 32) or button_events["reset"]
+        do_snap = key in (ord("s"), ord("S")) or button_events["snap"]
+
+        button_events["reset"] = False
+        button_events["snap"] = False
+
+        if key in (ord("q"), ord("Q"), 27):
             break
-        elif key == ord("r"):
+        elif do_reset:
             sm.reset()
             print("[INFO] Sequence tracker reset to Step 0.")
+        elif do_snap:
+            os.makedirs("errors", exist_ok=True)
+            ts = int(time.time())
+            snap_path = f"errors/live_snapshot_{ts}.jpg"
+            cv2.imwrite(snap_path, annotated)
+            raw_path = f"errors/live_raw_{ts}.jpg"
+            cv2.imwrite(raw_path, frame)
+            print(f"[INFO] Saved snapshot to '{snap_path}' and '{raw_path}'")
 
     cap.release()
     cv2.destroyAllWindows()
