@@ -482,9 +482,14 @@ class ComponentDetector:
 
         # Dual-Perception: Corroborate with classifier
         if cls_pred is not None:
+            # Check if spatial graph flagged an explicit physical violation (e.g. feet on opposite sides, illegal attachment)
+            is_explicit_violation = (not is_valid) and any(
+                diagnostic.startswith(prefix) for prefix in ["INCORRECT", "WRONG"]
+            )
+
             # 1. High-confidence cropped classifier corroboration for target state
-            # Prevents 2D bounding-box false alarms (e.g. slight tilt/occlusion) from blocking valid states
-            if cls_conf >= 0.85 and cls_pred == target_state:
+            # Can resolve borderline bbox ambiguities, but CANNOT override an explicit physical defect!
+            if cls_conf >= 0.85 and cls_pred == target_state and not is_explicit_violation:
                 inferred_state = cls_pred
                 conf = max(conf, cls_conf)
                 is_valid = True
@@ -496,7 +501,7 @@ class ComponentDetector:
                     inferred_state = "state_8_complete"
                     conf = max(conf, cls_conf)
                     diagnostic = "PASS: Complete 9-part block figure verified!"
-                elif cls_conf >= 0.80 and cls_pred == target_state:
+                elif cls_conf >= 0.80 and cls_pred == target_state and not is_explicit_violation:
                     inferred_state = cls_pred
                     conf = cls_conf
 
