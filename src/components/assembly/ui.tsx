@@ -9,30 +9,42 @@ export function TopBar() {
     { to: "/history", label: "History" },
     { to: "/analytics", label: "Analytics" },
   ] as const;
+
   return (
     <header className="h-16 border-b border-border bg-card flex items-center">
       <div className="mx-auto flex w-full max-w-[1200px] items-center justify-between px-4 md:px-6">
-        <Link to="/" className="font-bold">Assembly Monitor</Link>
-        <nav className="flex gap-2.5 text-xs sm:gap-3 sm:text-sm md:gap-[22px]">
+        <Link to="/" className="font-bold">
+          Assembly Monitor
+        </Link>
+        <nav className="flex items-center gap-2.5 text-xs sm:gap-3 sm:text-sm md:gap-[22px]">
           {links.map((l) => (
             <Link
               key={l.to}
               to={l.to}
               activeOptions={{ exact: true }}
-              className="text-muted-foreground"
+              className="text-muted-foreground hover:text-foreground transition-colors"
               activeProps={{ className: "!text-primary font-semibold" }}
             >
               {l.label}
             </Link>
           ))}
-          <Link to="/login" className="text-muted-foreground">Logout</Link>
         </nav>
       </div>
     </header>
   );
 }
 
-export function Page({ title, subtitle, right, children }: { title: string; subtitle: string; right?: ReactNode; children: ReactNode }) {
+export function Page({
+  title,
+  subtitle,
+  right,
+  children,
+}: {
+  title: string;
+  subtitle: string;
+  right?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <div className="min-h-screen bg-background">
       <TopBar />
@@ -51,12 +63,22 @@ export function Page({ title, subtitle, right, children }: { title: string; subt
 }
 
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
-  return <div className={cn("rounded-[10px] border border-border bg-card p-5 shadow-sm", className)}>{children}</div>;
+  return (
+    <div className={cn("rounded-[10px] border border-border bg-card p-5 shadow-sm", className)}>
+      {children}
+    </div>
+  );
 }
 
 const accents = ["border-t-primary", "border-t-success", "border-t-amber", "border-t-sky"];
 
-export function KpiGrid({ items, className }: { items: { label: string; value: ReactNode; note?: ReactNode }[]; className?: string }) {
+export function KpiGrid({
+  items,
+  className,
+}: {
+  items: { label: string; value: ReactNode; note?: ReactNode }[];
+  className?: string;
+}) {
   return (
     <section className={cn("grid grid-cols-2 gap-3 md:grid-cols-4", className)}>
       {items.map((k, i) => (
@@ -70,23 +92,60 @@ export function KpiGrid({ items, className }: { items: { label: string; value: R
   );
 }
 
-export function Badge({ tone, children }: { tone: "success" | "danger" | "warning"; children: ReactNode }) {
-  const t = { success: "bg-success-soft text-success", danger: "bg-destructive-soft text-destructive", warning: "bg-warning-soft text-warning" }[tone];
-  return <span className={cn("inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold", t)}>{children}</span>;
+export function Badge({
+  tone,
+  children,
+}: {
+  tone: "success" | "danger" | "warning";
+  children: ReactNode;
+}) {
+  const t = {
+    success: "bg-success-soft text-success",
+    danger: "bg-destructive-soft text-destructive",
+    warning: "bg-warning-soft text-warning",
+  }[tone];
+  return (
+    <span
+      className={cn("inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold", t)}
+    >
+      {children}
+    </span>
+  );
 }
 
-export function Progress({ value, className, barClass }: { value: number; className?: string; barClass?: string }) {
+export function Progress({
+  value,
+  className,
+  barClass,
+}: {
+  value: number;
+  className?: string;
+  barClass?: string;
+}) {
   return (
     <div className={cn("h-2 overflow-hidden rounded-full bg-muted", className)}>
-      <span className={cn("block h-full bg-primary", barClass)} style={{ width: `${Math.min(100, value)}%` }} />
+      <span
+        className={cn("block h-full bg-primary", barClass)}
+        style={{ width: `${Math.min(100, value)}%` }}
+      />
     </div>
   );
 }
 
 export function Btn({ className, ...p }: React.ButtonHTMLAttributes<HTMLButtonElement>) {
-  return <button {...p} className={cn("cursor-pointer rounded-lg border border-border bg-card px-3 py-2 text-xs hover:bg-accent hover:text-primary", className)} />;
+  return (
+    <button
+      {...p}
+      className={cn(
+        "cursor-pointer rounded-lg border border-border bg-card px-3 py-2 text-xs hover:bg-accent hover:text-primary",
+        className,
+      )}
+    />
+  );
 }
 
-export const inputCls = "rounded-lg border border-border bg-card px-3 py-2 text-[13px] min-w-40 focus:outline-2 focus:outline-primary/30 focus:border-primary";
-export const th = "whitespace-nowrap border-b border-border p-3 text-left text-[11px] font-semibold text-muted-foreground";
+export const inputCls =
+  "rounded-lg border border-border bg-card px-3 py-2 text-[13px] min-w-40 focus:outline-2 focus:outline-primary/30 focus:border-primary";
+export const th =
+  "whitespace-nowrap border-b border-border p-3 text-left text-[11px] font-semibold text-muted-foreground";
 export const td = "border-b border-border px-3 py-3 align-top";
