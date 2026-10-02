@@ -1,5 +1,6 @@
 import os
 import secrets
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -8,7 +9,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 
@@ -24,6 +25,7 @@ load_dotenv(ENV_FILE)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 CV_API_KEY = os.getenv("CV_API_KEY", "assembly-local-key").strip()
+DROIDCAM_DEFAULT_URL = os.getenv("DROIDCAM_URL", "http://192.168.2.217:4747/video").strip()
 
 USE_LOCAL_MODE = not (bool(SUPABASE_URL) and bool(SUPABASE_SERVICE_ROLE_KEY))
 
@@ -43,7 +45,7 @@ else:
 app = FastAPI(
     title="Assembly Performance API",
     description="Backend API and Dashboard for Live Block Assembly Inspection",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # Allow React / Hatchable dashboard to call the API.
@@ -200,7 +202,7 @@ class EndAssemblyRequest(BaseModel):
 
 
 # ============================================================
-# HEALTH & METRICS
+# HEALTH & CAMERA STREAM PROXY
 # ============================================================
 
 @app.get("/health")
@@ -211,6 +213,28 @@ def health():
         "mode": "local" if USE_LOCAL_MODE else "supabase",
         "supabase_configured": not USE_LOCAL_MODE,
     }
+
+
+@app.get("/api/camera/stream")
+def camera_stream():
+    """
+    Proxies the DroidCam MJPEG stream directly to browser clients.
+    """
+    def generate():
+        try:
+            req = urllib.request.urlopen(DROIDCAM_DEFAULT_URL, timeout=3.0)
+            while True:
+                chunk = req.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        except Exception:
+            return
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace;boundary=--dcmjpeg",
+    )
 
 
 # ============================================================
@@ -242,10 +266,12 @@ def start_assembly(
         random_part = secrets.token_hex(2).upper()
         cycle_id = f"ASM-{timestamp}-{random_part}"
         session_id = f"sess_{secrets.token_hex(4)}"
+        cycle_number = len(LOCAL_SESSIONS) + 1
 
         session_data = {
             "id": session_id,
             "cycle_id": cycle_id,
+            "cycle_number": cycle_number,
             "operator_id": op["id"],
             "operator_code": op["operator_code"],
             "operator_name": op["name"],
@@ -265,6 +291,7 @@ def start_assembly(
             "assembly": {
                 "id": session_id,
                 "cycle_id": cycle_id,
+                "cycle_number": cycle_number,
                 "operator_id": op["operator_code"],
                 "operator_name": op["name"],
                 "status": "in_progress",
@@ -356,10 +383,11 @@ def assembly_event(
     if USE_LOCAL_MODE:
         session = LOCAL_SESSIONS.get(data.cycle_id)
         if not session:
-            # Auto-provision session if started spontaneously
+            cycle_number = len(LOCAL_SESSIONS) + 1
             session = {
                 "id": f"sess_{secrets.token_hex(4)}",
                 "cycle_id": data.cycle_id,
+                "cycle_number": cycle_number,
                 "operator_id": "op_001",
                 "operator_code": "OP001",
                 "operator_name": "Harshal (Station Lead)",
@@ -399,9 +427,10 @@ def assembly_event(
 
         current_completed = session.get("states_completed") or 0
         new_completed = current_completed
-        if data.status in ["advanced", "completed"] and data.state_index is not None:
+        if data.status in ["advanced", "completed", "holding"] and data.state_index is not None:
             new_completed = max(current_completed, data.state_index)
             session["states_completed"] = new_completed
+        session["current_state_index"] = data.state_index
 
         return {
             "success": True,
@@ -468,7 +497,7 @@ def assembly_event(
     new_completed = current_completed
 
     if (
-        data.status in ["advanced", "completed"]
+        data.status in ["advanced", "completed", "holding"]
         and data.state_index is not None
     ):
         new_completed = max(
@@ -655,10 +684,28 @@ def get_latest():
         total = len(sessions)
         pass_rate = round((passes / total) * 100, 1) if total > 0 else 100.0
 
+        today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sessions_today = [
+            s for s in sessions
+            if (s.get("start_time") or "").startswith(today_prefix)
+        ]
+        cycles_done_today = sum(
+            1 for s in sessions_today
+            if s.get("status") in ["pass", "fail", "completed"]
+        )
+        today_passes = sum(1 for s in sessions_today if s.get("status") == "pass")
+        today_fails = sum(1 for s in sessions_today if s.get("status") == "fail")
+
+        active_cycle_number = latest_session.get("cycle_number") if latest_session else (len(sessions) if sessions else 1)
+
         return {
             "session": latest_session,
             "latest_event": latest_event,
             "total_cycles": total,
+            "active_cycle_number": active_cycle_number,
+            "cycles_done_today": cycles_done_today,
+            "today_passes": today_passes,
+            "today_fails": today_fails,
             "pass_count": passes,
             "fail_count": fails,
             "pass_rate": pass_rate,
@@ -676,17 +723,18 @@ def dashboard_ui():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Assembly Performance Dashboard | CV Edge HUD</title>
+  <title>Assembly Performance Dashboard | CV Edge Station</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
-    @keyframes pulse-fast { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    @keyframes pulse-fast { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
     .pulse-live { animation: pulse-fast 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased">
-  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur px-6 py-4 sticky top-0 z-50">
+  <!-- Top Navigation Bar -->
+  <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur px-6 py-4 sticky top-0 z-50">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
       <div class="flex items-center space-x-3">
         <div class="p-2.5 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20">
@@ -714,19 +762,87 @@ def dashboard_ui():
   </header>
 
   <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
-    <!-- Top Stats Cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
-        <div class="flex items-center justify-between text-slate-400 mb-2">
-          <span class="text-xs font-semibold uppercase tracking-wider">Active Cycle</span>
-          <i class="fa-solid fa-barcode text-slate-500"></i>
+    
+    <!-- 1. LIVE CAMERA FEED SECTION -->
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+      <div class="px-6 py-4 border-b border-slate-800 bg-slate-900/90 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2.5 bg-rose-500/10 text-rose-400 rounded-xl border border-rose-500/20">
+            <i class="fa-solid fa-video text-base"></i>
+          </div>
+          <div>
+            <h2 class="text-base font-bold text-white flex items-center gap-2">
+              Live Camera Stream
+              <span id="cam-status-pill" class="text-[11px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 pulse-live"></span>
+                <span id="cam-status-text">LIVE FEED</span>
+              </span>
+            </h2>
+            <p class="text-xs text-slate-400">DroidCam Feed: <span id="cam-active-ip" class="font-mono text-slate-300">192.168.2.217:4747</span></p>
+          </div>
         </div>
-        <div id="stat-cycle-id" class="text-lg font-mono font-bold text-white truncate">Waiting...</div>
-        <div id="stat-cycle-status" class="text-xs text-slate-400 mt-1 flex items-center gap-1.5">
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Idle / Awaiting Start
+        <div class="flex items-center gap-3">
+          <div class="flex items-center bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300 gap-2">
+            <i class="fa-solid fa-link text-slate-500"></i>
+            <input id="stream-url-input" type="text" value="http://192.168.2.217:4747/video" class="bg-transparent text-xs font-mono text-slate-200 outline-none w-56 placeholder-slate-600" placeholder="http://<ip>:4747/video" />
+            <button onclick="updateCameraStream()" class="hover:text-emerald-400 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition" title="Apply Stream URL">
+              <i class="fa-solid fa-arrow-rotate-right"></i>
+            </button>
+          </div>
+          <button onclick="toggleCamFullscreen()" class="p-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl transition text-xs" title="Expand View">
+            <i class="fa-solid fa-expand"></i>
+          </button>
         </div>
       </div>
 
+      <div class="relative bg-slate-950 flex items-center justify-center min-h-[360px] max-h-[500px] overflow-hidden group" id="cam-wrapper">
+        <img id="camera-stream-img" src="http://192.168.2.217:4747/video" alt="DroidCam Feed" class="w-full h-auto max-h-[480px] object-contain transition-all" onload="onStreamLoaded()" onerror="onStreamError()" />
+        
+        <!-- Stream Disconnected Overlay -->
+        <div id="cam-fallback" class="hidden absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-6 text-center">
+          <div class="p-6 bg-slate-900 border border-slate-800 rounded-2xl max-w-md shadow-2xl space-y-3">
+            <div class="w-12 h-12 bg-amber-500/10 text-amber-400 rounded-2xl flex items-center justify-center mx-auto text-xl border border-amber-500/20">
+              <i class="fa-solid fa-triangle-exclamation"></i>
+            </div>
+            <h3 class="text-sm font-bold text-white">DroidCam Stream Awaiting Connection</h3>
+            <p class="text-xs text-slate-400">Ensure the DroidCam app is open on your phone at <code id="fallback-ip-text" class="text-amber-300 font-mono">192.168.2.217:4747</code>, or update the URL above.</p>
+            <button onclick="updateCameraStream()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition flex items-center gap-2 mx-auto">
+              <i class="fa-solid fa-rotate"></i> Retry Connection
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. TOP STATS ROW (5 CARDS) -->
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+      
+      <!-- Card 1: Active Cycle Number -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 mb-2">
+          <span class="text-xs font-semibold uppercase tracking-wider">Active Cycle</span>
+          <i class="fa-solid fa-hashtag text-indigo-400"></i>
+        </div>
+        <div id="stat-cycle-num" class="text-3xl font-bold text-indigo-400">#1</div>
+        <div id="stat-cycle-id" class="text-[11px] font-mono text-slate-400 truncate mt-1">Waiting...</div>
+        <div id="stat-cycle-status" class="text-[11px] text-slate-400 mt-1 flex items-center gap-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Idle / Ready
+        </div>
+      </div>
+
+      <!-- Card 2: Cycles Done Today -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 mb-2">
+          <span class="text-xs font-semibold uppercase tracking-wider">Cycles Done Today</span>
+          <i class="fa-solid fa-calendar-day text-emerald-400"></i>
+        </div>
+        <div id="stat-cycles-done-today" class="text-3xl font-bold text-white">0</div>
+        <div class="text-xs text-slate-400 mt-1">
+          <span id="stat-today-passed" class="text-emerald-400 font-medium">0</span> passed, <span id="stat-today-failed" class="text-rose-400 font-medium">0</span> failed
+        </div>
+      </div>
+
+      <!-- Card 3: Assembly Progress -->
       <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
         <div class="flex items-center justify-between text-slate-400 mb-2">
           <span class="text-xs font-semibold uppercase tracking-wider">Progress</span>
@@ -741,40 +857,47 @@ def dashboard_ui():
         </div>
       </div>
 
+      <!-- Card 4: Quality Pass Rate -->
       <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
         <div class="flex items-center justify-between text-slate-400 mb-2">
           <span class="text-xs font-semibold uppercase tracking-wider">Pass Rate</span>
-          <i class="fa-solid fa-chart-line text-slate-500"></i>
+          <i class="fa-solid fa-chart-line text-emerald-400"></i>
         </div>
         <div id="stat-pass-rate" class="text-3xl font-bold text-emerald-400">100%</div>
         <div class="text-xs text-slate-400 mt-1">
-          <span id="stat-pass-count">0</span> passed, <span id="stat-fail-count" class="text-rose-400">0</span> failed
+          Total: <span id="stat-total-cycles" class="text-slate-300 font-medium">0</span> sessions
         </div>
       </div>
 
-      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
+      <!-- Card 5: AI Confidence -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm col-span-2 md:col-span-1">
         <div class="flex items-center justify-between text-slate-400 mb-2">
-          <span class="text-xs font-semibold uppercase tracking-wider">CV Confidence</span>
-          <i class="fa-solid fa-bullseye text-slate-500"></i>
+          <span class="text-xs font-semibold uppercase tracking-wider">AI Confidence</span>
+          <i class="fa-solid fa-bullseye text-cyan-400"></i>
         </div>
         <div id="stat-confidence" class="text-3xl font-bold text-cyan-400">--%</div>
         <div id="stat-latency" class="text-xs text-slate-400 mt-1 font-mono">Edge Latency: < 15ms</div>
       </div>
     </div>
 
-    <!-- Active Step Progress Timeline -->
+    <!-- 3. SEQUENTIAL ASSEMBLY CHECKLIST (GREEN TICKS & UPCOMING SPINNER) -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-sm">
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-5 flex items-center justify-between">
-        <span>Sequential Assembly Checklist</span>
-        <span id="current-state-title" class="text-sm font-medium text-emerald-400 font-mono">Step 0: Unstarted</span>
-      </h2>
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-5">
+        <div>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400">Sequential Assembly Checklist</h2>
+          <p class="text-xs text-slate-500">Green tick = Verified State &nbsp;•&nbsp; Spinner = Upcoming State to Assemble</p>
+        </div>
+        <span id="current-state-title" class="text-sm font-medium text-emerald-400 font-mono bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-lg">
+          0. Unstarted / Presenting Parts
+        </span>
+      </div>
 
-      <div class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-9 gap-2" id="steps-container">
-        <!-- 9 steps injected by JS -->
+      <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-9 gap-2.5" id="steps-container">
+        <!-- 9 steps dynamically injected -->
       </div>
     </div>
 
-    <!-- Diagnostic Banner -->
+    <!-- 4. DIAGNOSTIC ALERT BANNER -->
     <div id="diagnostic-banner" class="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex items-start gap-4 transition-all">
       <div id="banner-icon" class="p-3 bg-slate-800 text-slate-400 rounded-xl text-xl shrink-0">
         <i class="fa-solid fa-circle-info"></i>
@@ -782,18 +905,18 @@ def dashboard_ui():
       <div>
         <div id="banner-status" class="text-sm font-bold uppercase tracking-wider text-slate-300">Ready for Assembly</div>
         <div id="banner-text" class="text-sm text-slate-400 mt-1">
-          Waiting for live computer vision events from <code class="bg-slate-800 px-1.5 py-0.5 rounded text-slate-200">python live_demo.py --dashboard http://localhost:8000</code>.
+          Waiting for live computer vision events from <code class="bg-slate-800 px-1.5 py-0.5 rounded text-slate-200">python live_demo.py --camera phone --dashboard http://localhost:8000</code>.
         </div>
       </div>
     </div>
 
-    <!-- Live Event Feed -->
+    <!-- 5. LIVE VERIFICATION FEED TABLE -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-sm">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-base font-bold text-white flex items-center gap-2">
           <i class="fa-solid fa-stream text-emerald-400"></i> Live Verification Feed
         </h2>
-        <span class="text-xs font-mono text-slate-400" id="feed-count">0 events</span>
+        <span class="text-xs font-mono text-slate-400" id="feed-count">0 events logged</span>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-sm">
@@ -801,7 +924,7 @@ def dashboard_ui():
             <tr>
               <th class="py-3 px-4">Time</th>
               <th class="py-3 px-4">Cycle ID</th>
-              <th class="py-3 px-4">Step</th>
+              <th class="py-3 px-4">Step Title</th>
               <th class="py-3 px-4">Status</th>
               <th class="py-3 px-4">Confidence</th>
               <th class="py-3 px-4">Diagnostic Details</th>
@@ -832,28 +955,100 @@ def dashboard_ui():
       "8. Complete 9-Part Assembly"
     ];
 
-    function renderSteps(activeIdx) {
+    // ========================================================
+    // CAMERA STREAM CONTROLS
+    // ========================================================
+    const savedStreamUrl = localStorage.getItem("droidcam_stream_url") || "http://192.168.2.217:4747/video";
+    const streamInput = document.getElementById("stream-url-input");
+    const streamImg = document.getElementById("camera-stream-img");
+    const fallbackBox = document.getElementById("cam-fallback");
+    const camStatusPill = document.getElementById("cam-status-pill");
+    const camStatusText = document.getElementById("cam-status-text");
+    const camActiveIp = document.getElementById("cam-active-ip");
+
+    streamInput.value = savedStreamUrl;
+
+    function updateCameraStream() {
+      const url = streamInput.value.trim();
+      localStorage.setItem("droidcam_stream_url", url);
+      fallbackBox.classList.add("hidden");
+      streamImg.src = "";
+      setTimeout(() => {
+        streamImg.src = url;
+      }, 100);
+
+      try {
+        const parsed = new URL(url);
+        camActiveIp.innerText = parsed.host;
+      } catch (e) {
+        camActiveIp.innerText = url;
+      }
+    }
+
+    function onStreamLoaded() {
+      fallbackBox.classList.add("hidden");
+      camStatusPill.className = "text-[11px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5";
+      camStatusText.innerText = "LIVE FEED";
+    }
+
+    function onStreamError() {
+      fallbackBox.classList.remove("hidden");
+      document.getElementById("fallback-ip-text").innerText = streamInput.value;
+      camStatusPill.className = "text-[11px] font-mono uppercase bg-rose-500/20 text-rose-400 border border-rose-500/30 px-2.5 py-0.5 rounded-full flex items-center gap-1.5";
+      camStatusText.innerText = "OFFLINE";
+    }
+
+    function toggleCamFullscreen() {
+      const wrapper = document.getElementById("cam-wrapper");
+      if (!document.fullscreenElement) {
+        wrapper.requestFullscreen().catch(err => console.error(err));
+      } else {
+        document.exitFullscreen();
+      }
+    }
+
+    // ========================================================
+    // SEQUENTIAL CHECKLIST RENDERER
+    // - Detected states: Green Tick Mark
+    // - Upcoming state: Loading Spinner
+    // ========================================================
+    function renderSteps(detectedIdx) {
       const container = document.getElementById("steps-container");
       container.innerHTML = "";
+
       STEP_NAMES.forEach((name, idx) => {
-        let bg = "bg-slate-950/50 border-slate-800 text-slate-500";
-        let icon = '<i class="fa-regular fa-circle text-xs"></i>';
-        if (idx < activeIdx) {
-          bg = "bg-emerald-500/10 border-emerald-500/30 text-emerald-400";
-          icon = '<i class="fa-solid fa-check text-xs"></i>';
-        } else if (idx === activeIdx) {
-          bg = "bg-amber-500/10 border-amber-500/40 text-amber-300 ring-1 ring-amber-500/30";
-          icon = '<i class="fa-solid fa-spinner fa-spin text-xs"></i>';
+        let bg = "bg-slate-950/40 border-slate-800 text-slate-500";
+        let icon = '<i class="fa-regular fa-circle text-slate-600 text-xs"></i>';
+        let badge = '<span class="text-[9px] font-medium uppercase tracking-wider text-slate-600">PENDING</span>';
+
+        if (idx <= detectedIdx) {
+          // Detected state: show green tick mark
+          bg = "bg-emerald-500/10 border-emerald-500/40 text-emerald-300 ring-1 ring-emerald-500/20 shadow-[0_0_12px_rgba(16,185,129,0.15)]";
+          icon = '<i class="fa-solid fa-check text-emerald-400 font-extrabold text-sm"></i>';
+          badge = '<span class="text-[9px] font-bold uppercase tracking-wider text-emerald-400 bg-emerald-500/20 border border-emerald-500/30 px-2 py-0.5 rounded-full">DONE</span>';
+        } else if (idx === detectedIdx + 1 && detectedIdx < 8) {
+          // Upcoming state: show loading spinner
+          bg = "bg-amber-500/10 border-amber-500/40 text-amber-300 ring-2 ring-amber-500/30 shadow-[0_0_15px_rgba(245,158,11,0.2)]";
+          icon = '<i class="fa-solid fa-spinner fa-spin text-amber-400 text-sm"></i>';
+          badge = '<span class="text-[9px] font-bold uppercase tracking-wider text-amber-300 bg-amber-500/20 border border-amber-500/30 px-2 py-0.5 rounded-full pulse-live">UPCOMING</span>';
         }
+
         const div = document.createElement("div");
-        div.className = `border rounded-xl p-3 flex flex-col items-center text-center transition-all ${bg}`;
-        div.innerHTML = `<div class="mb-1">${icon}</div><div class="text-[11px] font-medium leading-tight">${name}</div>`;
+        div.className = `border rounded-xl p-3 flex flex-col items-center justify-between text-center transition-all min-h-[96px] ${bg}`;
+        div.innerHTML = `
+          <div class="mb-1 flex items-center justify-center h-6">${icon}</div>
+          <div class="text-[11px] font-medium leading-tight">${name}</div>
+          <div class="mt-2 h-4 flex items-center justify-center">${badge}</div>
+        `;
         container.appendChild(div);
       });
     }
 
     renderSteps(0);
 
+    // ========================================================
+    // REAL-TIME DASHBOARD POLLING
+    // ========================================================
     async function pollDashboard() {
       try {
         const [latestRes, eventsRes] = await Promise.all([
@@ -868,23 +1063,38 @@ def dashboard_ui():
           const sess = latestData.session;
           const evt = latestData.latest_event;
 
+          // 1. Update Active Cycle Card
           if (sess) {
+            document.getElementById("stat-cycle-num").innerText = `#${latestData.active_cycle_number || 1}`;
             document.getElementById("stat-cycle-id").innerText = sess.cycle_id;
-            const completed = sess.states_completed || 0;
+            
+            const completed = sess.states_completed !== undefined ? sess.states_completed : 0;
             document.getElementById("stat-step-num").innerText = completed;
             document.getElementById("stat-step-bar").style.width = `${Math.min(100, (completed / 8) * 100)}%`;
             renderSteps(completed);
 
             let statusText = sess.status.toUpperCase();
-            document.getElementById("stat-cycle-status").innerHTML =
-              `<span class="w-1.5 h-1.5 rounded-full ${sess.status === 'pass' ? 'bg-emerald-400' : 'bg-amber-400'}"></span> ${statusText}`;
+            if (sess.status === "in_progress") {
+              document.getElementById("stat-cycle-status").innerHTML =
+                '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 pulse-live"></span> IN PROGRESS';
+            } else {
+              document.getElementById("stat-cycle-status").innerHTML =
+                `<span class="w-1.5 h-1.5 rounded-full ${sess.status === 'pass' ? 'bg-emerald-400' : 'bg-rose-400'}"></span> ${statusText}`;
+            }
+
             document.getElementById("current-state-title").innerText = STEP_NAMES[completed] || `Step ${completed}`;
           }
 
-          document.getElementById("stat-pass-rate").innerText = `${latestData.pass_rate}%`;
-          document.getElementById("stat-pass-count").innerText = latestData.pass_count;
-          document.getElementById("stat-fail-count").innerText = latestData.fail_count;
+          // 2. Update Cycles Done Today
+          document.getElementById("stat-cycles-done-today").innerText = latestData.cycles_done_today || 0;
+          document.getElementById("stat-today-passed").innerText = latestData.today_passes || 0;
+          document.getElementById("stat-today-failed").innerText = latestData.today_fails || 0;
 
+          // 3. Update Overall Metrics
+          document.getElementById("stat-pass-rate").innerText = `${latestData.pass_rate}%`;
+          document.getElementById("stat-total-cycles").innerText = latestData.total_cycles || 0;
+
+          // 4. Update AI Confidence & Alert Banner
           if (evt) {
             const confPct = evt.confidence ? `${Math.round(evt.confidence * 100)}%` : '--%';
             document.getElementById("stat-confidence").innerText = confPct;
@@ -906,7 +1116,7 @@ def dashboard_ui():
               icon.className = "p-3 bg-emerald-500/20 text-emerald-400 rounded-xl text-xl shrink-0";
               icon.innerHTML = '<i class="fa-solid fa-circle-check"></i>';
               status.className = "text-sm font-bold uppercase tracking-wider text-emerald-400";
-              status.innerText = `ADVANCED TO ${STEP_NAMES[evt.state_index] || evt.state_name}`;
+              status.innerText = `VERIFIED: ${STEP_NAMES[evt.state_index] || evt.state_name}`;
               text.innerText = evt.diagnostic || "Part verified successfully with high spatial consensus.";
             } else if (evt.status === "holding") {
               banner.className = "bg-slate-900 border border-cyan-500/30 rounded-2xl p-5 flex items-start gap-4";
@@ -918,6 +1128,7 @@ def dashboard_ui():
             }
           }
 
+          // 5. Update Verification Table
           if (Array.isArray(events) && events.length > 0) {
             document.getElementById("feed-count").innerText = `${events.length} events logged`;
             const tbody = document.getElementById("events-table-body");
