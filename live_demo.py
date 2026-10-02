@@ -31,11 +31,14 @@ from block_config import BLOCK_COLORS_BGR, STEP_TITLES
 class DashboardBridge:
     """
     Non-blocking background bridge that posts real-time assembly events
-    to the teammate's FastAPI performance dashboard backend (backend/main.py).
+    to the FastAPI performance dashboard backend (backend/main.py).
     """
 
     def __init__(self, api_url=None, operator_id="OP001", api_key=""):
-        self.api_url = api_url.rstrip("/") if api_url else None
+        if api_url:
+            self.api_url = str(api_url).strip().strip(")'\"`").rstrip("/")
+        else:
+            self.api_url = None
         self.operator_id = operator_id
         self.api_key = api_key
         self.cycle_id = None
@@ -52,9 +55,11 @@ class DashboardBridge:
                 if self.api_key:
                     headers["x-cv-api-key"] = self.api_key
                 url = f"{self.api_url}{endpoint}"
-                requests.post(url, json=data, headers=headers, timeout=2.0)
-            except Exception:
-                pass
+                resp = requests.post(url, json=data, headers=headers, timeout=2.0)
+                if not resp.ok:
+                    print(f"[DashboardBridge WARN] POST {endpoint} returned {resp.status_code}")
+            except Exception as e:
+                print(f"[DashboardBridge WARN] POST {endpoint} failed: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -69,14 +74,19 @@ class DashboardBridge:
                 if self.api_key:
                     headers["x-cv-api-key"] = self.api_key
                 url = f"{self.api_url}/api/assembly/start"
-                resp = requests.post(url, json={"operator_id": self.operator_id}, headers=headers, timeout=2.0)
+                resp = requests.post(url, json={"operator_id": self.operator_id}, headers=headers, timeout=2.5)
                 if resp.ok:
                     res_json = resp.json()
                     self.cycle_id = res_json.get("assembly", {}).get("cycle_id")
-            except Exception:
-                pass
+                    print(f"[DashboardBridge] Connected! Tracking Assembly Cycle: {self.cycle_id}")
+                else:
+                    print(f"[DashboardBridge ERROR] Could not register cycle: {resp.status_code} {resp.text}")
+            except Exception as e:
+                print(f"[DashboardBridge ERROR] Connection failed to {self.api_url}: {e}")
 
-        threading.Thread(target=worker, daemon=True).start()
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(timeout=1.0)
 
     def log_event(self, state_index, state_name, status, confidence=1.0, diagnostic=""):
         if not self.enabled or not self.cycle_id:
@@ -350,25 +360,40 @@ def run_image(image_path, detector, sm):
 
 def open_working_camera(requested_source):
     """
-    Attempts to open the requested camera, falling back to alternative device indices (0, 1, 2)
-    if index 0 is unavailable or busy.
+    Attempts to open the requested camera, supporting:
+      1. Direct IP stream (e.g. DroidCam WiFi: http://<ip>:4747/video or 192.168.x.x:4747)
+      2. Device index (0, 1, 2) via DirectShow or default backend
     """
     if isinstance(requested_source, str) and not requested_source.isdigit():
-        cap = cv2.VideoCapture(requested_source)
-        if cap.isOpened():
-            return cap, requested_source
-        return None, requested_source
+        src = requested_source.strip()
+        if src.lower() in ("phone", "droid", "droidcam"):
+            src = "http://192.168.2.217:4747/video"
+        # Auto-format DroidCam IP if missing protocol or endpoint
+        if ":" in src and not src.startswith("http://") and not src.startswith("https://") and not src.startswith("rtsp://"):
+            src = f"http://{src}"
+        if src.startswith("http://") and ":4747" in src and not src.endswith("/video") and not src.endswith("/mjpegfeed"):
+            src = f"{src.rstrip('/')}/video"
 
-    requested_idx = int(requested_source) if isinstance(requested_source, str) else requested_source
-    candidate_indices = [requested_idx] + [i for i in [0, 1, 2] if i != requested_idx]
-
-    for idx in candidate_indices:
-        cap = cv2.VideoCapture(idx)
+        print(f"[INFO] Connecting to camera stream: {src} ...")
+        cap = cv2.VideoCapture(src)
         if cap.isOpened():
             ret, _ = cap.read()
             if ret:
-                return cap, idx
+                return cap, src
             cap.release()
+        return None, requested_source
+
+    requested_idx = int(requested_source) if isinstance(requested_source, str) else requested_source
+    candidate_indices = [requested_idx] + [i for i in [0, 1, 2, 3] if i != requested_idx]
+
+    for idx in candidate_indices:
+        for backend in [cv2.CAP_DSHOW, cv2.CAP_ANY]:
+            cap = cv2.VideoCapture(idx, backend)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    return cap, idx
+                cap.release()
 
     return None, requested_source
 
@@ -413,6 +438,8 @@ def run_video(video_source, detector, sm, dashboard=None):
 
     prev_time = time.perf_counter()
     prev_state_idx = -1
+    prev_error_active = False
+    last_event_time = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -430,18 +457,43 @@ def run_video(video_source, detector, sm, dashboard=None):
         res = detector.analyze(frame, current_step_index=sm.current_index)
         annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps)
 
-        # Log state advancements or errors to Dashboard backend if connected
+        # Log state advancements, defects/errors, or periodic telemetry to Dashboard backend
         if dashboard and dashboard.enabled:
-            if sm.current_index != prev_state_idx:
+            if not dashboard.cycle_id:
+                dashboard.start_cycle()
+
+            now = time.perf_counter()
+            state_changed = (sm.current_index != prev_state_idx)
+            error_changed = (sm.error_active != prev_error_active)
+            heartbeat_due = (now - last_event_time > 1.2)
+
+            if state_changed or error_changed or heartbeat_due:
                 prev_state_idx = sm.current_index
+                prev_error_active = sm.error_active
+                last_event_time = now
+
+                if sm.error_active:
+                    ev_status = "error"
+                    diag = sm.error_detail or res.get("diagnostic", "Assembly defect detected")
+                elif sm.is_complete():
+                    ev_status = "completed"
+                    diag = "Assembly Completed & Verified"
+                elif state_changed:
+                    ev_status = "advanced"
+                    diag = res.get("diagnostic", f"Advanced to Step {sm.current_index}")
+                else:
+                    ev_status = "holding"
+                    diag = res.get("diagnostic", "Holding step verification")
+
                 dashboard.log_event(
                     state_index=sm.current_index,
                     state_name=sm.current_state(),
-                    status="completed" if sm.is_complete() else "advanced",
-                    confidence=res["confidence"],
-                    diagnostic=res.get("diagnostic", ""),
+                    status=ev_status,
+                    confidence=res.get("confidence", 0.0),
+                    diagnostic=diag,
                 )
-                if sm.is_complete():
+
+                if sm.is_complete() and state_changed:
                     dashboard.end_cycle(status="pass", completed=8)
 
         cv2.imshow(window_name, annotated)
@@ -458,6 +510,8 @@ def run_video(video_source, detector, sm, dashboard=None):
         elif do_reset:
             sm.reset()
             prev_state_idx = -1
+            prev_error_active = False
+            last_event_time = 0.0
             if dashboard and dashboard.enabled:
                 dashboard.start_cycle()
             print("[INFO] Sequence tracker reset to Step 0.")
@@ -481,11 +535,12 @@ def main():
     parser.add_argument("--camera", type=str, default="0", help="Webcam index (0, 1) or IP URL")
     parser.add_argument("--dashboard", type=str, default=None, help="Optional FastAPI dashboard backend URL (e.g. http://localhost:8000)")
     parser.add_argument("--operator", type=str, default="OP001", help="Operator ID for dashboard session (default: OP001)")
+    parser.add_argument("--api-key", type=str, default=os.getenv("CV_API_KEY", "assembly-local-key"), help="CV API key for dashboard authentication")
     args = parser.parse_args()
 
     detector = ComponentDetector()
     sm = AssemblyStateMachine()
-    dashboard = DashboardBridge(api_url=args.dashboard, operator_id=args.operator) if args.dashboard else None
+    dashboard = DashboardBridge(api_url=args.dashboard, operator_id=args.operator, api_key=args.api_key) if args.dashboard else None
 
     if args.image:
         run_image(args.image, detector, sm)
