@@ -253,15 +253,21 @@ def hud_stream():
     to browser clients as a standard MJPEG stream.
     """
     def generate():
+        last_sent_time = 0.0
         while True:
             if LATEST_HUD_FRAME and (time.time() - LATEST_FRAME_TIME < 3.0):
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + LATEST_HUD_FRAME
-                    + b"\r\n"
-                )
-            time.sleep(0.033)  # ~30 FPS
+                # Yield when a new frame arrives or periodic heartbeat
+                if LATEST_FRAME_TIME != last_sent_time or (time.time() - last_sent_time > 1.0):
+                    last_sent_time = LATEST_FRAME_TIME
+                    frame_data = LATEST_HUD_FRAME
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame_data)).encode() + b"\r\n\r\n"
+                        + frame_data
+                        + b"\r\n"
+                    )
+            time.sleep(0.02)
 
     return StreamingResponse(
         generate(),

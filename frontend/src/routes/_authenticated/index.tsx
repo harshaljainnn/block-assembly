@@ -10,6 +10,7 @@ import {
   td,
   th,
 } from "@/components/assembly/ui";
+import { LiveFeed } from "@/components/assembly/live-feed";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/integrations/supabase/client";
 import type { Database } from "@/integrations/supabase/types";
@@ -471,6 +472,8 @@ function LiveMonitor() {
         </div>
       }
     >
+      <LiveFeed className="mb-4" />
+
       <section>
         <Card>
           <div className="mb-1.5 text-xs text-muted-foreground">

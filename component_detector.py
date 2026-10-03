@@ -617,7 +617,7 @@ class ComponentDetector:
 
         if self.cls_model is not None:
             cls_input = crop_img if (self.is_cropped_model and crop_img is not None) else img
-            res_cls = self.cls_model.predict(cls_input, verbose=False)[0]
+            res_cls = self.cls_model.predict(cls_input, imgsz=160, verbose=False)[0]
             cand_pred = res_cls.names[res_cls.probs.top1]
             cand_conf = float(res_cls.probs.top1conf)
 

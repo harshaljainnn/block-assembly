@@ -352,9 +352,9 @@ class BlockDetector:
         refined.sort(key=lambda d: d["area"], reverse=True)
         return refined
 
-    def detect_yolo(self, img):
+    def detect_yolo(self, img, imgsz=416):
         """Runs inference with the trained YOLO object detection model."""
-        res = self.yolo_model.predict(img, conf=self.conf_threshold, verbose=False)[0]
+        res = self.yolo_model.predict(img, imgsz=imgsz, conf=self.conf_threshold, verbose=False)[0]
         detections = []
         for box in res.boxes:
             cls_id = int(box.cls[0])

@@ -44,7 +44,7 @@ class DashboardBridge:
         self.cycle_id = None
         self.enabled = bool(self.api_url)
 
-        self._latest_jpeg = None
+        self._latest_frame = None
         self._frame_lock = threading.Lock()
         self._stop_event = threading.Event()
         if self.enabled:
@@ -52,44 +52,50 @@ class DashboardBridge:
 
     def update_frame(self, frame):
         """
-        Compresses the annotated HUD frame to JPEG and hands it off to the background streamer.
+        Hands off the annotated HUD frame to the background streamer without blocking.
         """
-        if not self.enabled:
+        if not self.enabled or frame is None:
             return
-        try:
-            h, w = frame.shape[:2]
-            if w > 960:
-                scale = 960.0 / w
-                frame = cv2.resize(frame, (960, int(h * scale)), interpolation=cv2.INTER_AREA)
-
-            ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
-            if ret:
-                with self._frame_lock:
-                    self._latest_jpeg = buf.tobytes()
-        except Exception:
-            pass
+        with self._frame_lock:
+            self._latest_frame = frame
 
     def _start_frame_streamer(self):
         def worker():
             import requests
             session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=2)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
             headers = {"Content-Type": "image/jpeg"}
             if self.api_key:
                 headers["x-cv-api-key"] = self.api_key
             url = f"{self.api_url}/api/camera/frame"
 
-            while not self._stop_event.is_set():
-                jpeg_data = None
-                with self._frame_lock:
-                    jpeg_data = self._latest_jpeg
-                    self._latest_jpeg = None
+            target_interval = 0.05  # Cap dashboard stream at a stable 20 FPS
+            last_post_time = 0.0
 
-                if jpeg_data:
+            while not self._stop_event.is_set():
+                frame = None
+                with self._frame_lock:
+                    if self._latest_frame is not None:
+                        frame = self._latest_frame
+                        self._latest_frame = None
+
+                now = time.perf_counter()
+                if frame is not None and (now - last_post_time >= target_interval):
+                    last_post_time = now
                     try:
-                        session.post(url, data=jpeg_data, headers=headers, timeout=0.5)
+                        h, w = frame.shape[:2]
+                        if w > 720:
+                            scale = 720.0 / w
+                            frame = cv2.resize(frame, (720, int(h * scale)), interpolation=cv2.INTER_LINEAR)
+                        ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 68])
+                        if ret:
+                            session.post(url, data=buf.tobytes(), headers=headers, timeout=0.35)
                     except Exception:
                         pass
-                time.sleep(0.033)
+                else:
+                    time.sleep(0.01)
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -168,7 +174,7 @@ class DashboardBridge:
         )
 
 
-def draw_hud(frame, result, state_machine, smoothed=True, fps=None):
+def draw_hud(frame, result, state_machine, smoothed=True, fps=None, update_sm=True):
     """
     Renders an industrial quality inspection HUD onto the camera frame.
     Displays:
@@ -187,15 +193,22 @@ def draw_hud(frame, result, state_machine, smoothed=True, fps=None):
     is_valid = result.get("is_valid", True)
     diagnostic = result.get("diagnostic", "")
 
-    if smoothed:
-        status, detail, consensus_state, votes_ratio = state_machine.update_smoothed(
-            state, is_valid_spatial=is_valid, diagnostic=diagnostic
-        )
-        display_state = consensus_state if consensus_state else state
+    if update_sm:
+        if smoothed:
+            status, detail, consensus_state, votes_ratio = state_machine.update_smoothed(
+                state, is_valid_spatial=is_valid, diagnostic=diagnostic
+            )
+            display_state = consensus_state if consensus_state else state
+        else:
+            status, detail = state_machine.update(state, is_valid_spatial=is_valid, diagnostic=diagnostic)
+            votes_ratio = "1/1"
+            display_state = state
     else:
-        status, detail = state_machine.update(state, is_valid_spatial=is_valid, diagnostic=diagnostic)
-        votes_ratio = "1/1"
-        display_state = state
+        top_state, count = state_machine.get_consensus()
+        display_state = top_state if top_state else state
+        votes_ratio = f"{count}/{state_machine.window_size}"
+        status = "error" if state_machine.error_active else ("completed" if state_machine.is_complete() else "in_progress")
+        detail = state_machine.error_detail
 
     is_error = status == "error" or state_machine.error_active
     is_done = state_machine.is_complete()
@@ -417,7 +430,7 @@ def open_working_camera(requested_source):
     if isinstance(requested_source, str) and not requested_source.isdigit():
         src = requested_source.strip()
         if src.lower() in ("phone", "droid", "droidcam"):
-            src = "http://192.168.2.217:4747/video"
+            src = os.getenv("DROIDCAM_URL", "http://192.168.2.217:4747/video")
         # Auto-format DroidCam IP if missing protocol or endpoint
         if ":" in src and not src.startswith("http://") and not src.startswith("https://") and not src.startswith("rtsp://"):
             src = f"http://{src}"
@@ -431,7 +444,7 @@ def open_working_camera(requested_source):
             if ret:
                 return cap, src
             cap.release()
-        return None, requested_source
+        return None, src
 
     requested_idx = int(requested_source) if isinstance(requested_source, str) else requested_source
     candidate_indices = [requested_idx] + [i for i in [0, 1, 2, 3] if i != requested_idx]
@@ -451,11 +464,19 @@ def open_working_camera(requested_source):
 def run_video(video_source, detector, sm, dashboard=None):
     cap, active_src = open_working_camera(video_source)
     if cap is None:
-        print(f"[ERROR] Could not open video source: {video_source}")
-        print("Tip: If using DroidCam client, try device index 1 or 2:")
-        print("     python live_demo.py --camera 1")
-        print("     Or use the direct WiFi IP URL from the DroidCam app:")
-        print("     python live_demo.py --camera http://<PHONE_IP>:4747/video")
+        print(f"\n[ERROR] Could not open video source: {video_source}")
+        print("=" * 60)
+        print("Options to connect a video source:")
+        print("  1. Laptop Webcam:")
+        print("     python live_demo.py --camera 0 --dashboard http://localhost:8000")
+        print()
+        print("  2. Phone Camera (DroidCam):")
+        print("     Check the 'WiFi IP' displayed in the DroidCam app on your phone, then run:")
+        print("     python live_demo.py --camera http://<YOUR_PHONE_IP>:4747/video --dashboard http://localhost:8000")
+        print()
+        print("  3. Pre-recorded Dataset Video (Immediate test without camera):")
+        print("     python live_demo.py --video DATASET/state8_complete.mp4 --dashboard http://localhost:8000")
+        print("=" * 60)
         return
 
     print(f"\nLive Inspection active on camera [{active_src}].")
@@ -486,6 +507,21 @@ def run_video(video_source, detector, sm, dashboard=None):
     mouse_param = {"w": 640, "h": 480}
     cv2.setMouseCallback(window_name, on_mouse, mouse_param)
 
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+    # Read first frame to initialize resolution and warm up detector
+    ret, first_frame = cap.read()
+    if not ret or first_frame is None:
+        print("[ERROR] Failed to read initial frame.")
+        cap.release()
+        return
+
+    mouse_param["w"] = first_frame.shape[1]
+    mouse_param["h"] = first_frame.shape[0]
+
     prev_time = time.perf_counter()
     prev_state_idx = -1
     prev_error_active = False
@@ -493,35 +529,116 @@ def run_video(video_source, detector, sm, dashboard=None):
     cycle_completed = False
     cycle_completed_time = 0.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        curr_time = time.perf_counter()
-        dt = curr_time - prev_time
-        prev_time = curr_time
-        fps = (1.0 / dt) if dt > 0 else 30.0
+            curr_time = time.perf_counter()
+            dt = curr_time - prev_time
+            prev_time = curr_time
+            fps = (1.0 / dt) if dt > 0 else 10.0
 
-        mouse_param["w"] = frame.shape[1]
-        mouse_param["h"] = frame.shape[0]
+            mouse_param["w"] = frame.shape[1]
+            mouse_param["h"] = frame.shape[0]
 
-        res = detector.analyze(frame, current_step_index=sm.current_index)
-        annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps)
+            # Analyze frame directly for 100% stable, jitter-free bounding box alignment
+            res = detector.analyze(frame, current_step_index=sm.current_index)
+            annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps, update_sm=True)
 
-        # Stream the live AI HUD frame (with bounding boxes, labels, and PiP) to dashboard
-        if dashboard and dashboard.enabled:
-            dashboard.update_frame(annotated)
+            # Stream to dashboard background streamer (rate-limited to stable 20 FPS)
+            if dashboard and dashboard.enabled:
+                dashboard.update_frame(annotated)
 
-        # Check if sequence machine auto-reset after completion or workspace clear
-        if cycle_completed:
-            elapsed_complete = time.perf_counter() - cycle_completed_time
-            if sm.current_index == 0 or not sm.is_complete() or elapsed_complete >= 4.0:
+            # Check if sequence machine auto-reset after completion or workspace clear
+            if cycle_completed:
+                elapsed_complete = time.perf_counter() - cycle_completed_time
+                if sm.current_index == 0 or not sm.is_complete() or elapsed_complete >= 4.0:
+                    sm.reset()
+                    cycle_completed = False
+                    prev_state_idx = 0
+                    prev_error_active = False
+                    last_event_time = time.perf_counter()
+                    if dashboard and dashboard.enabled:
+                        dashboard.start_cycle()
+                        dashboard.log_event(
+                            state_index=0,
+                            state_name=sm.current_state(),
+                            status="holding",
+                            confidence=1.0,
+                            diagnostic="Station Ready for Next Unit",
+                        )
+                    print("[INFO] Station reset: Next assembly cycle started at Step 0.")
+
+            # Log state advancements, defects/errors, or periodic telemetry to Dashboard backend
+            if dashboard and dashboard.enabled:
+                if not dashboard.cycle_id and not cycle_completed:
+                    dashboard.start_cycle()
+
+                now = time.perf_counter()
+                state_changed = (sm.current_index != prev_state_idx)
+                error_changed = (sm.error_active != prev_error_active)
+                heartbeat_due = (now - last_event_time > 1.2)
+
+                # Cycle completion trigger (Step 8 reached)
+                if sm.is_complete() and not cycle_completed:
+                    cycle_completed = True
+                    cycle_completed_time = now
+                    prev_state_idx = sm.current_index
+                    prev_error_active = False
+                    last_event_time = now
+
+                    dashboard.log_event(
+                        state_index=8,
+                        state_name=sm.current_state(),
+                        status="completed",
+                        confidence=res.get("confidence", 1.0),
+                        diagnostic="8. Complete 9-Part Assembly Verified",
+                    )
+                    dashboard.end_cycle(status="pass", completed=8)
+                    print("[INFO] Assembly Cycle Complete (PASS)! Clear workspace to start next unit.")
+
+                elif not cycle_completed and (state_changed or error_changed or heartbeat_due):
+                    prev_state_idx = sm.current_index
+                    prev_error_active = sm.error_active
+                    last_event_time = now
+
+                    if sm.error_active:
+                        ev_status = "error"
+                        diag = sm.error_detail or res.get("diagnostic", "Assembly defect detected")
+                    elif state_changed:
+                        ev_status = "advanced"
+                        diag = res.get("diagnostic", f"Advanced to Step {sm.current_index}")
+                    else:
+                        ev_status = "holding"
+                        diag = res.get("diagnostic", "Holding step verification")
+
+                    dashboard.log_event(
+                        state_index=sm.current_index,
+                        state_name=sm.current_state(),
+                        status=ev_status,
+                        confidence=res.get("confidence", 0.0),
+                        diagnostic=diag,
+                    )
+
+            cv2.imshow(window_name, annotated)
+
+            key = cv2.waitKey(1) & 0xFF
+            do_reset = key in (ord("r"), ord("R"), 32) or button_events["reset"]
+            do_snap = key in (ord("s"), ord("S")) or button_events["snap"]
+
+            button_events["reset"] = False
+            button_events["snap"] = False
+
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            elif do_reset:
                 sm.reset()
                 cycle_completed = False
                 prev_state_idx = 0
                 prev_error_active = False
-                last_event_time = time.perf_counter()
+                last_event_time = 0.0
                 if dashboard and dashboard.enabled:
                     dashboard.start_cycle()
                     dashboard.log_event(
@@ -529,99 +646,21 @@ def run_video(video_source, detector, sm, dashboard=None):
                         state_name=sm.current_state(),
                         status="holding",
                         confidence=1.0,
-                        diagnostic="Station Ready for Next Unit",
+                        diagnostic="Sequence Reset to Step 0",
                     )
-                print("[INFO] Station reset: Next assembly cycle started at Step 0.")
+                print("[INFO] Sequence tracker reset to Step 0.")
+            elif do_snap:
+                os.makedirs("snapshots", exist_ok=True)
+                ts = int(time.time())
+                snap_path = f"snapshots/snapshot_{ts}.jpg"
+                cv2.imwrite(snap_path, annotated)
+                raw_path = f"snapshots/raw_{ts}.jpg"
+                cv2.imwrite(raw_path, frame)
+                print(f"[INFO] Saved snapshot to '{snap_path}' and '{raw_path}'")
 
-        # Log state advancements, defects/errors, or periodic telemetry to Dashboard backend
-        if dashboard and dashboard.enabled:
-            if not dashboard.cycle_id and not cycle_completed:
-                dashboard.start_cycle()
-
-            now = time.perf_counter()
-            state_changed = (sm.current_index != prev_state_idx)
-            error_changed = (sm.error_active != prev_error_active)
-            heartbeat_due = (now - last_event_time > 1.2)
-
-            # Cycle completion trigger (Step 8 reached)
-            if sm.is_complete() and not cycle_completed:
-                cycle_completed = True
-                cycle_completed_time = now
-                prev_state_idx = sm.current_index
-                prev_error_active = False
-                last_event_time = now
-
-                dashboard.log_event(
-                    state_index=8,
-                    state_name=sm.current_state(),
-                    status="completed",
-                    confidence=res.get("confidence", 1.0),
-                    diagnostic="8. Complete 9-Part Assembly Verified",
-                )
-                dashboard.end_cycle(status="pass", completed=8)
-                print("[INFO] Assembly Cycle Complete (PASS)! Clear workspace to start next unit.")
-
-            elif not cycle_completed and (state_changed or error_changed or heartbeat_due):
-                prev_state_idx = sm.current_index
-                prev_error_active = sm.error_active
-                last_event_time = now
-
-                if sm.error_active:
-                    ev_status = "error"
-                    diag = sm.error_detail or res.get("diagnostic", "Assembly defect detected")
-                elif state_changed:
-                    ev_status = "advanced"
-                    diag = res.get("diagnostic", f"Advanced to Step {sm.current_index}")
-                else:
-                    ev_status = "holding"
-                    diag = res.get("diagnostic", "Holding step verification")
-
-                dashboard.log_event(
-                    state_index=sm.current_index,
-                    state_name=sm.current_state(),
-                    status=ev_status,
-                    confidence=res.get("confidence", 0.0),
-                    diagnostic=diag,
-                )
-
-        cv2.imshow(window_name, annotated)
-
-        key = cv2.waitKey(1) & 0xFF
-        do_reset = key in (ord("r"), ord("R"), 32) or button_events["reset"]
-        do_snap = key in (ord("s"), ord("S")) or button_events["snap"]
-
-        button_events["reset"] = False
-        button_events["snap"] = False
-
-        if key in (ord("q"), ord("Q"), 27):
-            break
-        elif do_reset:
-            sm.reset()
-            cycle_completed = False
-            prev_state_idx = 0
-            prev_error_active = False
-            last_event_time = 0.0
-            if dashboard and dashboard.enabled:
-                dashboard.start_cycle()
-                dashboard.log_event(
-                    state_index=0,
-                    state_name=sm.current_state(),
-                    status="holding",
-                    confidence=1.0,
-                    diagnostic="Sequence Reset to Step 0",
-                )
-            print("[INFO] Sequence tracker reset to Step 0.")
-        elif do_snap:
-            os.makedirs("snapshots", exist_ok=True)
-            ts = int(time.time())
-            snap_path = f"snapshots/snapshot_{ts}.jpg"
-            cv2.imwrite(snap_path, annotated)
-            raw_path = f"snapshots/raw_{ts}.jpg"
-            cv2.imwrite(raw_path, frame)
-            print(f"[INFO] Saved snapshot to '{snap_path}' and '{raw_path}'")
-
-    cap.release()
-    cv2.destroyAllWindows()
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 def main():
