@@ -241,7 +241,58 @@ class DashboardBridge:
         self._stop_event.set()
 
 
-def draw_hud(frame, result, state_machine, smoothed=True, fps=None, update_sm=True):
+class HandMotionTracker:
+    """
+    Tracks optical motion and hand activity inside the active assembly ROI.
+    Prevents transient sequence rejections or erratic state jumps while operator
+    hands are actively in-flight holding or placing a block.
+    """
+
+    def __init__(self, motion_threshold=18.0, stillness_duration=0.30):
+        self.motion_threshold = motion_threshold
+        self.stillness_duration = stillness_duration
+        self.prev_gray = None
+        self.stillness_start = time.perf_counter()
+        self.is_hand_active = False
+
+    def update(self, frame, crop_bbox=None):
+        if frame is None:
+            return False, 0.0
+
+        h, w = frame.shape[:2]
+        if crop_bbox and crop_bbox[2] > 40 and crop_bbox[3] > 40:
+            cx, cy, cw, ch = crop_bbox
+            x1, y1 = max(0, cx - 25), max(0, cy - 25)
+            x2, y2 = min(w, cx + cw + 25), min(h, cy + ch + 25)
+            roi = frame[y1:y2, x1:x2]
+        else:
+            roi = frame[int(h * 0.20):int(h * 0.85), int(w * 0.15):int(w * 0.85)]
+
+        if roi.size == 0:
+            return False, 0.0
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (15, 15), 0)
+
+        motion_score = 0.0
+        now = time.perf_counter()
+
+        if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
+            diff = cv2.absdiff(self.prev_gray, gray)
+            motion_score = float(np.mean(diff))
+
+            if motion_score > self.motion_threshold:
+                self.is_hand_active = True
+                self.stillness_start = now
+            else:
+                if now - self.stillness_start >= self.stillness_duration:
+                    self.is_hand_active = False
+
+        self.prev_gray = gray
+        return self.is_hand_active, motion_score
+
+
+def draw_hud(frame, result, state_machine, smoothed=True, fps=None, update_sm=True, hand_active=False):
     """
     Renders an industrial quality inspection HUD onto the camera frame.
     Displays:
@@ -262,8 +313,11 @@ def draw_hud(frame, result, state_machine, smoothed=True, fps=None, update_sm=Tr
 
     if update_sm:
         if smoothed:
+            # Hand-Stillness Protection: if operator's hand is in motion inside ROI, suppress latching hard sequence errors
+            adj_valid = is_valid if not hand_active else True
+            adj_diag = diagnostic if (not hand_active or diagnostic.startswith("PASS")) else "ASSEMBLING: Placing block..."
             status, detail, consensus_state, votes_ratio = state_machine.update_smoothed(
-                state, is_valid_spatial=is_valid, diagnostic=diagnostic
+                state, is_valid_spatial=adj_valid, diagnostic=adj_diag
             )
             display_state = consensus_state if consensus_state else state
         else:
@@ -276,6 +330,10 @@ def draw_hud(frame, result, state_machine, smoothed=True, fps=None, update_sm=Tr
         votes_ratio = f"{count}/{state_machine.window_size}"
         status = "error" if state_machine.error_active else ("completed" if state_machine.is_complete() else "in_progress")
         detail = state_machine.error_detail
+
+    if hand_active and not state_machine.is_complete() and not state_machine.error_active:
+        status = "assembling"
+        detail = "HAND IN MOTION: Placing part... (settle to inspect)"
 
     is_error = status == "error" or state_machine.error_active
     is_done = state_machine.is_complete()
@@ -595,6 +653,7 @@ def run_video(video_source, detector, sm, dashboard=None):
     last_event_time = 0.0
     cycle_completed = False
     cycle_completed_time = 0.0
+    motion_tracker = HandMotionTracker(motion_threshold=16.0, stillness_duration=0.35)
 
     try:
         while True:
@@ -612,7 +671,8 @@ def run_video(video_source, detector, sm, dashboard=None):
 
             # Analyze frame directly for 100% stable, jitter-free bounding box alignment
             res = detector.analyze(frame, current_step_index=sm.current_index)
-            annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps, update_sm=True)
+            is_hand_moving, _ = motion_tracker.update(frame, crop_bbox=res.get("crop_bbox"))
+            annotated = draw_hud(frame.copy(), res, sm, smoothed=True, fps=fps, update_sm=True, hand_active=is_hand_moving)
 
             # Stream to dashboard background streamer (rate-limited to stable 20 FPS)
             if dashboard and dashboard.enabled:
