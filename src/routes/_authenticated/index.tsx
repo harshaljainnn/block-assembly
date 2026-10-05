@@ -197,7 +197,7 @@ function LiveMonitor() {
       setAssembly(targetAssembly);
 
       /*
-       * 2. Live Events Feed
+       * 2. Live Events Feed (Keep recent 15 logs)
        */
       let fetchedEvents: AssemblyEvent[] = [];
       if (targetAssembly) {
@@ -206,7 +206,7 @@ function LiveMonitor() {
           .select("*")
           .eq("assembly_id", targetAssembly.id)
           .order("timestamp", { ascending: false })
-          .limit(30);
+          .limit(15);
 
         if (sessionEvents && sessionEvents.length > 0) {
           fetchedEvents = sessionEvents;
@@ -218,12 +218,12 @@ function LiveMonitor() {
           .from("assembly_events")
           .select("*")
           .order("timestamp", { ascending: false })
-          .limit(30);
+          .limit(15);
 
         fetchedEvents = globalEvents ?? [];
       }
 
-      setEvents(fetchedEvents);
+      setEvents(fetchedEvents.slice(0, 15));
 
       /*
        * 3. Today's assemblies
@@ -658,7 +658,7 @@ function LiveMonitor() {
             <div className="font-bold">Live Event Log</div>
 
             <div className="mt-1 text-xs text-muted-foreground">
-              Latest assembly events
+              Recent 15 assembly events
             </div>
           </div>
 
