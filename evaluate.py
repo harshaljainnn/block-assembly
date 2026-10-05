@@ -40,6 +40,14 @@ def evaluate_states(detector):
         "state6": ("state_6_yellowafter2red", 6),
         "state7": ("state_7_finalred", 7),
         "state8": ("state_8_complete", 8),
+        "state_1_greenblue": ("state_1_greenblue", 1),
+        "state_2_green2blue": ("state_2_green2blue", 2),
+        "state_3_first_red": ("state_3_first_red", 3),
+        "state_4_yellowred": ("state_4_yellowred", 4),
+        "state_5_bothred": ("state_5_bothred", 5),
+        "state_6_yellowafter2red": ("state_6_yellowafter2red", 6),
+        "state_7_finalred": ("state_7_finalred", 7),
+        "state_8_complete": ("state_8_complete", 8),
     }
 
     for sname in sorted(os.listdir(states_dir)):

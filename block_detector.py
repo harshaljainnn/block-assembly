@@ -335,7 +335,7 @@ class BlockDetector:
         """Backward compatible helper forwarding to split_merged_block."""
         return self.split_merged_block(detection, img)
 
-    def split_merged_blocks(self, detections, img):
+    def split_merged_blocks(self, detections, img, current_step_index=None):
         """
         Inspects all detections and splits any merged blocks (both red and blue blocks).
         """
@@ -344,7 +344,10 @@ class BlockDetector:
 
         refined = []
         for d in detections:
-            if d.get("class_name") in ("red_block", "blue_block"):
+            cname = d.get("class_name")
+            if cname == "blue_block" and current_step_index == 1:
+                refined.append(d)
+            elif cname in ("red_block", "blue_block"):
                 refined.extend(self.split_merged_block(d, img))
             else:
                 refined.append(d)
@@ -379,7 +382,7 @@ class BlockDetector:
         detections.sort(key=lambda d: d["area"], reverse=True)
         return detections
 
-    def detect(self, img):
+    def detect(self, img, current_step_index=None):
         """
         Unified detection entry point.
         Uses YOLO detector if available, otherwise falls back to plastic-ratio color detector.
@@ -390,7 +393,7 @@ class BlockDetector:
         else:
             raw_dets = self.detect_color_plastic(img)
 
-        return self.split_merged_blocks(raw_dets, img)
+        return self.split_merged_blocks(raw_dets, img, current_step_index=current_step_index)
 
     def identify_incoming_object(self, detections):
         """

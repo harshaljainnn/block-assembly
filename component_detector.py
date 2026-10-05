@@ -530,10 +530,25 @@ class ComponentDetector:
 
         gdet = greens[0] if greens else None
 
-        # 1. Blue feet: split wide/tall boxes covering both feet, then cluster stud halves
-        if blues and img is not None:
+        # 1. Blue feet: split wide/tall boxes covering both feet only when not strictly at Step 1 with single foot
+        if blues and img is not None and current_step_index != 1:
             blues = self.split_merged_blue_feet(blues, img, gdet)
         resolved_blues = self.cluster_feet_along_beam(blues, gdet) if len(blues) > 1 else blues
+        if current_step_index == 1 and len(resolved_blues) > 1 and gdet is not None:
+            # Step 1 physically has only 1 blue foot; cluster all blue stud slivers near green beam into one foot
+            bx1 = min(b["bbox"][0] for b in resolved_blues)
+            by1 = min(b["bbox"][1] for b in resolved_blues)
+            bx2 = max(b["bbox"][0] + b["bbox"][2] for b in resolved_blues)
+            by2 = max(b["bbox"][1] + b["bbox"][3] for b in resolved_blues)
+            resolved_blues = [{
+                "class_name": "blue_block",
+                "class_id": 0,
+                "bbox": (bx1, by1, bx2 - bx1, by2 - by1),
+                "center": (bx1 + (bx2 - bx1) // 2, by1 + (by2 - by1) // 2),
+                "area": (bx2 - bx1) * (by2 - by1),
+                "confidence": max(b["confidence"] for b in resolved_blues),
+                "source": "step1_clustered",
+            }]
 
         # 2. Red blocks: at Step 3, ensure any secondary stud detection on the 1st red block is merged
         if current_step_index == 3 and len(reds) > 1 and gdet is not None:
@@ -591,7 +606,7 @@ class ComponentDetector:
             }
 
         # 1. Detect all blocks in frame with YOLO/plastic detector
-        raw_detections = self.block_detector.detect(img)
+        raw_detections = self.block_detector.detect(img, current_step_index=current_step_index)
         cleaned_detections = self.deduplicate_detections(raw_detections, img=img, current_step_index=current_step_index)
 
 
@@ -617,20 +632,30 @@ class ComponentDetector:
 
         if self.cls_model is not None:
             cls_input = crop_img if (self.is_cropped_model and crop_img is not None) else img
-            res_cls = self.cls_model.predict(cls_input, imgsz=160, verbose=False)[0]
+            res_cls = self.cls_model.predict(cls_input, imgsz=384, verbose=False)[0]
             cand_pred = res_cls.names[res_cls.probs.top1]
             cand_conf = float(res_cls.probs.top1conf)
 
-            # Sanity-check: reject hallucinations that require parts not physically present
+            # Sanity-check: if YOLO missed a faint yellow or red block, verify with plastic color detection in crop
+            if cand_conf >= 0.70 and crop_img is not None and crop_img.size > 0:
+                if cand_pred in ["state_4_yellowred", "state_5_bothred", "state_6_yellowafter2red", "state_7_finalred", "state_8_complete"] and "yellow_block" not in det_colors:
+                    crop_colors = self.block_detector.detect_color_plastic(crop_img)
+                    if any(c["class_name"] == "yellow_block" for c in crop_colors):
+                        det_colors.add("yellow_block")
+                if cand_pred in ["state_3_first_red", "state_4_yellowred", "state_5_bothred", "state_6_yellowafter2red", "state_7_finalred", "state_8_complete"] and "red_block" not in det_colors:
+                    crop_colors = self.block_detector.detect_color_plastic(crop_img)
+                    if any(c["class_name"] == "red_block" for c in crop_colors):
+                        det_colors.add("red_block")
+
             is_physically_consistent = True
             if cand_pred in ["state_3_first_red", "state_4_yellowred", "state_5_bothred", "state_6_yellowafter2red", "state_7_finalred", "state_8_complete"]:
-                if "red_block" not in det_colors:
+                if "red_block" not in det_colors and cand_conf < 0.90:
                     is_physically_consistent = False
             if cand_pred in ["state_4_yellowred", "state_5_bothred", "state_6_yellowafter2red", "state_7_finalred", "state_8_complete"]:
-                if "yellow_block" not in det_colors:
+                if "yellow_block" not in det_colors and cand_conf < 0.90:
                     is_physically_consistent = False
             if cand_pred in ["state_1_greenblue", "state_2_green2blue", "state_3_first_red"] and len(cleaned_detections) < 4:
-                if "green_block" not in det_colors:
+                if "green_block" not in det_colors and cand_conf < 0.90:
                     is_physically_consistent = False
 
             if is_physically_consistent:
@@ -676,23 +701,24 @@ class ComponentDetector:
                 diagnostic.startswith(prefix) for prefix in ["INCORRECT", "WRONG"]
             )
 
-            # 1. High-confidence cropped classifier corroboration for target state
-            # Can resolve borderline bbox ambiguities, but CANNOT override an explicit physical defect!
-            if cls_conf >= 0.85 and cls_pred == target_state and not is_explicit_violation:
-                inferred_state = cls_pred
-                conf = max(conf, cls_conf)
-                is_valid = True
-                diagnostic = f"PASS: {target_state} verified by cropped inspection ({cls_conf*100:.1f}%)"
+            next_state = ASSEMBLY_STATES[current_step_index + 1] if current_step_index + 1 < len(ASSEMBLY_STATES) else None
+
+            # 1. High-confidence cropped classifier corroboration for target state or next step
+            # Can resolve bounding box clustering/overlap ambiguities, but CANNOT override an explicit physical defect!
+            if not is_explicit_violation:
+                if cls_conf >= 0.48 and cls_pred == target_state:
+                    inferred_state = cls_pred
+                    conf = max(conf, cls_conf)
+                    is_valid = True
+                    diagnostic = f"PASS: {target_state} verified by inspection ({cls_conf*100:.1f}%)"
+                elif cls_conf >= 0.75 and cls_pred == next_state and (is_valid or not diagnostic.startswith("INCORRECT")):
+                    inferred_state = cls_pred
+                    conf = max(conf, cls_conf)
+                    is_valid = True
+                    diagnostic = f"PASS: Advanced to {next_state} verified by inspection ({cls_conf*100:.1f}%)"
             elif is_valid:
                 if graph_eval["inferred_state"] == cls_pred:
                     conf = min(0.99, max(conf, (conf + cls_conf) / 2.0))
-                elif cls_pred == "state_8_complete" and current_step_index == 7 and graph_eval["inferred_state"] == "state_8_complete":
-                    inferred_state = "state_8_complete"
-                    conf = max(conf, cls_conf)
-                    diagnostic = "PASS: Complete 9-part block figure verified!"
-                elif cls_conf >= 0.80 and cls_pred == target_state and not is_explicit_violation:
-                    inferred_state = cls_pred
-                    conf = cls_conf
 
         # 7. Incoming Object Callout
         incoming_info = None
