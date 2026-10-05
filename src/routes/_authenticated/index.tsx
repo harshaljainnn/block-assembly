@@ -11,6 +11,7 @@ import {
   th,
 } from "@/components/assembly/ui";
 import { cn } from "@/lib/utils";
+import { LiveFeed } from "@/components/assembly/live-feed";
 import { supabase } from "@/integrations/supabase/client";
 import type { Database } from "@/integrations/supabase/types";
 
@@ -108,6 +109,14 @@ function formatIncomingObject(value: string | null) {
   }
 }
 
+function formatStateName(name: string | null) {
+  if (!name) return "—";
+  return name
+    .replace(/^state_\d+_?/, (match) => `State ${match.replace(/\D/g, "")}: `)
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
 function eventStatusLabel(status: string) {
   switch (status) {
     case "advanced":
@@ -154,19 +163,37 @@ function LiveMonitor() {
 
       /*
        * 1. Active or latest assembly
-       * If a specific operator is selected in the filter, filter by operator_id.
+       * First check if there is an in-progress session. If not, pick the latest.
        */
-      let query = supabase
+      let inProgressQuery = supabase
         .from("assembly_sessions")
         .select("*")
+        .eq("status", "in_progress")
         .order("start_time", { ascending: false });
 
       if (selectedOperatorId !== "all") {
-        query = query.eq("operator_id", selectedOperatorId);
+        inProgressQuery = inProgressQuery.eq("operator_id", selectedOperatorId);
       }
 
-      const { data: latestSessions } = await query.limit(1);
-      const targetAssembly: AssemblySession | null = latestSessions?.[0] ?? null;
+      const { data: inProgressSessions } = await inProgressQuery.limit(1);
+
+      let targetAssembly: AssemblySession | null =
+        inProgressSessions?.[0] ?? null;
+
+      if (!targetAssembly) {
+        let latestQuery = supabase
+          .from("assembly_sessions")
+          .select("*")
+          .order("start_time", { ascending: false });
+
+        if (selectedOperatorId !== "all") {
+          latestQuery = latestQuery.eq("operator_id", selectedOperatorId);
+        }
+
+        const { data: latestSessions } = await latestQuery.limit(1);
+        targetAssembly = latestSessions?.[0] ?? null;
+      }
+
       setAssembly(targetAssembly);
 
       /*
@@ -179,7 +206,7 @@ function LiveMonitor() {
           .select("*")
           .eq("assembly_id", targetAssembly.id)
           .order("timestamp", { ascending: false })
-          .limit(25);
+          .limit(30);
 
         if (sessionEvents && sessionEvents.length > 0) {
           fetchedEvents = sessionEvents;
@@ -191,7 +218,7 @@ function LiveMonitor() {
           .from("assembly_events")
           .select("*")
           .order("timestamp", { ascending: false })
-          .limit(25);
+          .limit(30);
 
         fetchedEvents = globalEvents ?? [];
       }
@@ -333,10 +360,10 @@ function LiveMonitor() {
       )
       .subscribe();
 
-    // Heartbeat poll every 2.5 seconds to guarantee live updates
+    // Heartbeat poll every 1 second to guarantee instant live updates
     const interval = window.setInterval(() => {
       void loadLiveData();
-    }, 2500);
+    }, 1000);
 
     return () => {
       void supabase.removeChannel(channel);
@@ -381,20 +408,26 @@ function LiveMonitor() {
     return Math.max(0, (now - start) / 1000);
   }, [assembly, now]);
 
+  const currentStepNumber = Math.max(
+    assembly?.states_completed || 0,
+    latestEvent?.state_index || 0,
+  );
+
+  const totalStatesNumber = Math.max(1, assembly?.total_states || 9);
+
   const progress = assembly
     ? Math.min(
       100,
-      Math.round(
-        (assembly.states_completed / Math.max(1, assembly.total_states)) *
-        100,
-      ),
+      Math.round((currentStepNumber / totalStatesNumber) * 100),
     )
     : 0;
 
   const currentState = latestEvent
-    ? latestEvent.state_title ||
-    latestEvent.state_name ||
-    `State ${latestEvent.state_index ?? "—"}`
+    ? formatStateName(
+      latestEvent.state_title ||
+      latestEvent.state_name ||
+      `State ${latestEvent.state_index ?? "—"}`,
+    )
     : assembly
       ? `State ${assembly.states_completed || 0}`
       : "No active assembly";
@@ -442,6 +475,32 @@ function LiveMonitor() {
       ? Math.min(100, Math.round((myCompletedSessions.length / dailyGoal) * 100))
       : 0;
 
+  const handleStopCycle = async () => {
+    if (!assembly || assembly.status !== "in_progress") return;
+
+    try {
+      const nowIso = new Date().toISOString();
+      const calculatedDuration = Math.max(
+        1,
+        Math.floor((Date.now() - new Date(assembly.start_time).getTime()) / 1000),
+      );
+
+      await supabase
+        .from("assembly_sessions")
+        .update({
+          status: "fail",
+          failure_reason: "Inspection stopped by user",
+          end_time: nowIso,
+          duration_seconds: calculatedDuration,
+        })
+        .eq("id", assembly.id);
+
+      await loadLiveData();
+    } catch (err) {
+      console.error("Failed to stop cycle:", err);
+    }
+  };
+
   return (
     <Page
       title="Live Monitor"
@@ -471,6 +530,8 @@ function LiveMonitor() {
         </div>
       }
     >
+      <LiveFeed className="mb-4" />
+
       <section>
         <Card>
           <div className="mb-1.5 text-xs text-muted-foreground">
@@ -490,19 +551,31 @@ function LiveMonitor() {
                       : "NO ACTIVE ASSEMBLY"}
             </div>
 
-            <Badge
-              tone={
-                assembly?.status === "fail"
-                  ? "danger"
-                  : isInProgress
-                    ? "success"
-                    : "success"
-              }
-            >
-              {isInProgress
-                ? "ACTIVE"
-                : assembly?.status?.toUpperCase() ?? "IDLE"}
-            </Badge>
+            <div className="flex items-center gap-2">
+              {isInProgress && (
+                <button
+                  type="button"
+                  onClick={() => void handleStopCycle()}
+                  className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-1 text-xs font-semibold text-destructive hover:bg-destructive hover:text-white transition-colors"
+                >
+                  Stop Cycle
+                </button>
+              )}
+
+              <Badge
+                tone={
+                  assembly?.status === "fail"
+                    ? "danger"
+                    : isInProgress
+                      ? "success"
+                      : "success"
+                }
+              >
+                {isInProgress
+                  ? "ACTIVE"
+                  : assembly?.status?.toUpperCase() ?? "IDLE"}
+              </Badge>
+            </div>
           </div>
 
           <div className="mt-5 flex justify-between text-[13px]">
@@ -539,12 +612,13 @@ function LiveMonitor() {
 
             <Meta
               label="Latest State"
-              value={
+              value={formatStateName(
                 latestEvent?.state_title ||
-                (latestEvent?.state_index
-                  ? `State ${latestEvent.state_index}`
-                  : "—")
-              }
+                  latestEvent?.state_name ||
+                  (latestEvent?.state_index
+                    ? `State ${latestEvent.state_index}`
+                    : "—"),
+              )}
             />
           </div>
         </Card>
@@ -640,9 +714,13 @@ function LiveMonitor() {
                       </td>
 
                       <td className={td}>
-                        {event.state_index != null
-                          ? `State ${event.state_index}`
-                          : event.state_name || "—"}
+                        {formatStateName(
+                          event.state_title ||
+                            event.state_name ||
+                            (event.state_index != null
+                              ? `State ${event.state_index}`
+                              : "—"),
+                        )}
                       </td>
 
                       <td className={td}>
