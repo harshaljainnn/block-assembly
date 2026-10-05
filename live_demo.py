@@ -16,6 +16,7 @@ Usage:
     python live_demo.py --dashboard http://localhost:8000   # Stream events to FastAPI dashboard
 """
 
+import queue
 import os
 import time
 import argparse
@@ -31,24 +32,32 @@ from block_config import BLOCK_COLORS_BGR, STEP_TITLES
 class DashboardBridge:
     """
     Non-blocking background bridge that posts real-time assembly events
-    to the FastAPI performance dashboard backend (backend/main.py).
+    and annotated camera frames to the FastAPI performance dashboard backend (backend/main.py).
     """
 
-    def __init__(self, api_url=None, operator_id="OP001", api_key=""):
+    def __init__(self, api_url=None, operator_id="OP001", api_key=None):
         if api_url:
             self.api_url = str(api_url).strip().strip(")'\"`").rstrip("/")
         else:
             self.api_url = None
         self.operator_id = operator_id
-        self.api_key = api_key
+        self.api_key = api_key if api_key is not None else os.getenv("CV_API_KEY", "assembly-local-key")
         self.cycle_id = None
         self.enabled = bool(self.api_url)
 
         self._latest_frame = None
         self._frame_lock = threading.Lock()
         self._stop_event = threading.Event()
+
+        # Queue-based event dispatch & synchronization
+        self._event_queue = queue.Queue(maxsize=150)
+        self._cycle_ready = threading.Event()
+        self._is_starting = False
+        self._starting_lock = threading.Lock()
+
         if self.enabled:
             self._start_frame_streamer()
+            self._start_event_worker()
 
     def update_frame(self, frame):
         """
@@ -100,78 +109,136 @@ class DashboardBridge:
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
-    def _async_post(self, endpoint, data):
-        if not self.enabled:
-            return
-
+    def _start_event_worker(self):
         def worker():
-            try:
-                import requests
-                headers = {"Content-Type": "application/json"}
-                if self.api_key:
-                    headers["x-cv-api-key"] = self.api_key
-                url = f"{self.api_url}{endpoint}"
-                resp = requests.post(url, json=data, headers=headers, timeout=2.0)
-                if not resp.ok:
-                    print(f"[DashboardBridge WARN] POST {endpoint} returned {resp.status_code}")
-            except Exception as e:
-                print(f"[DashboardBridge WARN] POST {endpoint} failed: {e}")
+            import requests
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["x-cv-api-key"] = self.api_key
 
-        threading.Thread(target=worker, daemon=True).start()
+            while not self._stop_event.is_set():
+                try:
+                    action, payload = self._event_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
 
-    def start_cycle(self):
-        if not self.enabled:
-            return
+                try:
+                    if action == "START":
+                        url = f"{self.api_url}/api/assembly/start"
+                        resp = session.post(
+                            url,
+                            json={"operator_id": self.operator_id},
+                            headers=headers,
+                            timeout=6.0,
+                        )
+                        if resp.ok:
+                            res_json = resp.json()
+                            self.cycle_id = res_json.get("assembly", {}).get("cycle_id")
+                            print(f"[DashboardBridge] Connected! Tracking Assembly Cycle: {self.cycle_id}")
+                            self._cycle_ready.set()
+                        else:
+                            print(f"[DashboardBridge ERROR] Could not register cycle: {resp.status_code} {resp.text}")
+                        with self._starting_lock:
+                            self._is_starting = False
 
-        def worker():
-            try:
-                import requests
-                headers = {"Content-Type": "application/json"}
-                if self.api_key:
-                    headers["x-cv-api-key"] = self.api_key
-                url = f"{self.api_url}/api/assembly/start"
-                resp = requests.post(url, json={"operator_id": self.operator_id}, headers=headers, timeout=2.5)
-                if resp.ok:
-                    res_json = resp.json()
-                    self.cycle_id = res_json.get("assembly", {}).get("cycle_id")
-                    print(f"[DashboardBridge] Connected! Tracking Assembly Cycle: {self.cycle_id}")
-                else:
-                    print(f"[DashboardBridge ERROR] Could not register cycle: {resp.status_code} {resp.text}")
-            except Exception as e:
-                print(f"[DashboardBridge ERROR] Connection failed to {self.api_url}: {e}")
+                    elif action == "EVENT":
+                        if not self.cycle_id and self._is_starting:
+                            self._cycle_ready.wait(timeout=4.0)
+
+                        if self.cycle_id:
+                            payload["cycle_id"] = self.cycle_id
+                            url = f"{self.api_url}/api/assembly/event"
+                            resp = session.post(url, json=payload, headers=headers, timeout=6.0)
+                            if not resp.ok:
+                                print(f"[DashboardBridge WARN] Event POST returned {resp.status_code}")
+
+                    elif action == "END":
+                        cid = payload.get("cycle_id") or self.cycle_id
+                        if cid:
+                            payload["cycle_id"] = cid
+                            url = f"{self.api_url}/api/assembly/end"
+                            resp = session.post(url, json=payload, headers=headers, timeout=6.0)
+                            if resp.ok:
+                                print(f"[DashboardBridge] Cycle {cid} closed: status={payload.get('status')}")
+                            else:
+                                print(f"[DashboardBridge WARN] End POST returned {resp.status_code}")
+
+                        self.cycle_id = None
+                        self._cycle_ready.clear()
+                        with self._starting_lock:
+                            self._is_starting = False
+
+                except Exception as e:
+                    print(f"[DashboardBridge ERROR] Worker error on {action}: {e}")
+                finally:
+                    self._event_queue.task_done()
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-        t.join(timeout=1.0)
 
-    def log_event(self, state_index, state_name, status, confidence=1.0, diagnostic=""):
-        if not self.enabled or not self.cycle_id:
+    def start_cycle(self, wait=False):
+        if not self.enabled:
             return
-        self._async_post(
-            "/api/assembly/event",
-            {
-                "cycle_id": self.cycle_id,
-                "state_index": state_index,
-                "state_name": state_name,
-                "status": status,
-                "confidence": float(confidence),
-                "diagnostic": diagnostic,
-            },
-        )
 
-    def end_cycle(self, status="pass", completed=8):
-        if not self.enabled or not self.cycle_id:
+        with self._starting_lock:
+            if self._is_starting or self.cycle_id is not None:
+                return
+            self._is_starting = True
+
+        self._cycle_ready.clear()
+        self._event_queue.put(("START", {}))
+
+        if wait:
+            self._cycle_ready.wait(timeout=5.0)
+
+    @property
+    def is_starting(self):
+        with self._starting_lock:
+            return self._is_starting
+
+    def log_event(self, state_index, state_name, status, confidence=1.0, diagnostic="", state_title=None, incoming_obj=None):
+        if not self.enabled:
+            return
+
+        payload = {
+            "state_index": state_index,
+            "state_name": state_name,
+            "state_title": state_title or STEP_TITLES.get(state_name, state_name),
+            "status": status,
+            "confidence": float(confidence),
+            "diagnostic": diagnostic,
+        }
+
+        if incoming_obj:
+            payload["incoming_object"] = incoming_obj.get("class_name")
+            payload["incoming_confidence"] = float(incoming_obj.get("confidence", 0.0))
+            payload["incoming_expected"] = bool(incoming_obj.get("is_expected", True))
+
+        try:
+            self._event_queue.put_nowait(("EVENT", payload))
+        except queue.Full:
+            pass
+
+    def end_cycle(self, status="pass", completed=8, failure_reason=None):
+        if not self.enabled:
             return
         cid = self.cycle_id
-        self.cycle_id = None
-        self._async_post(
-            "/api/assembly/end",
-            {
-                "cycle_id": cid,
-                "status": status,
-                "states_completed": completed,
-            },
-        )
+        self._event_queue.put(("END", {
+            "cycle_id": cid,
+            "status": status,
+            "states_completed": completed,
+            "failure_reason": failure_reason,
+        }))
+
+    def stop(self):
+        deadline = time.perf_counter() + 3.0
+        while not self._event_queue.empty() and time.perf_counter() < deadline:
+            time.sleep(0.05)
+        self._stop_event.set()
 
 
 def draw_hud(frame, result, state_machine, smoothed=True, fps=None, update_sm=True):
@@ -483,7 +550,7 @@ def run_video(video_source, detector, sm, dashboard=None):
     print("Controls: 'r'/Space = Reset, 's' = Snapshot, 'q'/Esc = Quit. (Or click on-screen buttons)")
     if dashboard and dashboard.enabled:
         print(f"Dashboard Bridge connected to: {dashboard.api_url}")
-        dashboard.start_cycle()
+        dashboard.start_cycle(wait=True)
 
     window_name = "Block Assembly Checker (Live HUD)"
     button_events = {"reset": False, "snap": False}
@@ -573,13 +640,13 @@ def run_video(video_source, detector, sm, dashboard=None):
 
             # Log state advancements, defects/errors, or periodic telemetry to Dashboard backend
             if dashboard and dashboard.enabled:
-                if not dashboard.cycle_id and not cycle_completed:
+                if not dashboard.cycle_id and not dashboard.is_starting and not cycle_completed:
                     dashboard.start_cycle()
 
                 now = time.perf_counter()
                 state_changed = (sm.current_index != prev_state_idx)
                 error_changed = (sm.error_active != prev_error_active)
-                heartbeat_due = (now - last_event_time > 1.2)
+                heartbeat_due = (now - last_event_time > 2.0)
 
                 # Cycle completion trigger (Step 8 reached)
                 if sm.is_complete() and not cycle_completed:
@@ -595,6 +662,7 @@ def run_video(video_source, detector, sm, dashboard=None):
                         status="completed",
                         confidence=res.get("confidence", 1.0),
                         diagnostic="8. Complete 9-Part Assembly Verified",
+                        incoming_obj=res.get("incoming_object"),
                     )
                     dashboard.end_cycle(status="pass", completed=8)
                     print("[INFO] Assembly Cycle Complete (PASS)! Clear workspace to start next unit.")
@@ -620,6 +688,7 @@ def run_video(video_source, detector, sm, dashboard=None):
                         status=ev_status,
                         confidence=res.get("confidence", 0.0),
                         diagnostic=diag,
+                        incoming_obj=res.get("incoming_object"),
                     )
 
             cv2.imshow(window_name, annotated)
@@ -659,6 +728,10 @@ def run_video(video_source, detector, sm, dashboard=None):
                 print(f"[INFO] Saved snapshot to '{snap_path}' and '{raw_path}'")
 
     finally:
+        if dashboard and dashboard.enabled:
+            if dashboard.cycle_id and not cycle_completed:
+                dashboard.end_cycle(status="fail", completed=sm.current_index, failure_reason="Inspection stopped by user")
+            dashboard.stop()
         cap.release()
         cv2.destroyAllWindows()
 
